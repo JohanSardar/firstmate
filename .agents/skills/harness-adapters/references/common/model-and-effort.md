@@ -6,6 +6,7 @@ Add `references/common/dispatch.md` for configured profile precedence.
 ## Axes and precedence
 
 `../../../bin/fm-spawn.sh` accepts concrete `--harness`, `--model`, and `--effort` values selected at intake; scripts never parse natural-language dispatch rules.
+Its opt-in `--preset` path is the exception that resolves a named, already-classified fixed or weighted experiment from `config/task-model-presets.json`; it still never parses natural language.
 The tool reference records verified flags, accepted values, omission behavior, and discovery.
 
 Effort precedence is a per-task captain instruction, then applicable dispatch profile or secondmate pin, then the fallback below.

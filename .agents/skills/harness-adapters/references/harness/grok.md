@@ -1,7 +1,7 @@
 # Grok Build
 
 The xAI `grok` TUI is Claude-Code-compatible.
-Verified initially on 2026-06-29 with 0.2.73, slash submission on 2026-07-03 with 0.2.82, effort on 2026-07-13 with 0.2.99, and exit on 2026-07-19 with 0.2.103.
+Verified initially on 2026-06-29 with 0.2.73, slash submission on 2026-07-03 with 0.2.82, effort on 2026-07-13 with 0.2.99, exit on 2026-07-19 with 0.2.103, and xhigh plus session identity on 2026-09-12 with 1.0.30.
 Launch shape: `grok --always-approve "$(cat <brief>)"`.
 
 ## Operating facts
@@ -16,8 +16,9 @@ Launch shape: `grok --always-approve "$(cat <brief>)"`.
 | Marker | `GROK_AGENT=1` on child or tool processes in 0.2.73 and no `CLAUDECODE`; a 1.0.0 hook instead had `GROK_HOOK_EVENT`, `GROK_HOOK_NAME`, `GROK_SESSION_ID`, and `GROK_WORKSPACE_ROOT` without `GROK_AGENT`, so ancestry guarantees identity. |
 | Resume | `grok --resume <session-id>`, or `grok -c` / `--continue` for cwd latest; `--fork-session` creates a new id. |
 | Model | `--model <model>`; discover current account models with `grok models`. |
-| Effort | `--reasoning-effort <low\|medium\|high>`, alias `--effort`; version 0.2.99 rejects `xhigh` and `max` with `use one of: high, medium, low`; `references/common/model-and-effort.md` owns fallback and unsupported-value handling. |
+| Effort | `--reasoning-effort <low\|medium\|high\|xhigh>`, alias `--effort`; xhigh is verified for current Grok Build 1.0.30 and grok-4.6, while max remains unsupported; `references/common/model-and-effort.md` owns fallback and unsupported-value handling. |
 
+An opt-in task/model preset assigns a fresh `--session-id <uuid>` so local model and effort evidence can be joined to the task without inspecting conversation content.
 Reliable Grok rules must account for hook markers as well as the child fast path.
 `../../../docs/turnend-guard.md` under "Harness integrations" owns the marker contract.
 

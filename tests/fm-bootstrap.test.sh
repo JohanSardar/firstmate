@@ -1107,7 +1107,7 @@ test_task_model_preset_bootstrap_validation() {
   rm -f "$fakebin/node"
   ln -s "$(command -v node)" "$fakebin/node"
   cat > "$case_dir/home/config/task-model-presets.json" <<'JSON'
-{"schema_version":1,"seed":"synthetic","presets":{"weighted":{"mode":"weighted","candidates":[{"id":"a","weight":1,"harness":"pi","model":"vendor/model-a","effort":"high"},{"id":"b","weight":1,"harness":"grok","model":"model-b","effort":"high"}]}}}
+{"schema_version":1,"seed":"synthetic","presets":{"weighted":{"mode":"weighted","candidates":[{"id":"a","weight":1,"harness":"pi","model":"vendor/model-a","effort":"high"},{"id":"b","weight":1,"harness":"grok","model":"model-b","effort":"xhigh"}]}}}
 JSON
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
@@ -1161,7 +1161,7 @@ malformed dispatch config is flagged^{"rules":[^exact^CREW_DISPATCH: invalid con
 unverified dispatch harness is flagged^{"rules":[{"when":"anything","use":{"harness":"spaceship"}}],"default":{"harness":"codex"}}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - unverified harness: spaceship
 unsupported codex max effort is flagged^{"rules":[{"when":"big feature","use":{"harness":"codex","model":"gpt-5","effort":"max"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: codex:max
 unsupported grok max effort is flagged^{"rules":[{"when":"deep current work","use":{"harness":"grok","model":"grok-4","effort":"max"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: grok:max
-unsupported grok xhigh effort is flagged^{"rules":[{"when":"deep current work","use":{"harness":"grok","model":"grok-4","effort":"xhigh"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: grok:xhigh
+grok xhigh effort is accepted^{"rules":[{"when":"deep current work","use":{"harness":"grok","model":"grok-4","effort":"xhigh"}}]}^empty^
 native pi ultra is accepted^{"rules":[],"default":{"harness":"pi","model":"codex-native/gpt-6-astra","effort":"ultra"}}^empty^
 native signed pi ultra is accepted^{"rules":[{"when":"native reasoning","use":{"harness":"pi-signed","model":"codex-native/gpt-6-astra","effort":"ultra"}}]}^empty^
 ordinary pi ultra is refused^{"default":{"harness":"pi","model":"openai-codex/gpt-6-astra","effort":"ultra"}}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: pi:ultra

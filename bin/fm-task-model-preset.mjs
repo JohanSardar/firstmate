@@ -10,10 +10,10 @@ const ALLOWED_HARNESSES = new Set(["pi", "pi-signed", "grok", "claude", "opencod
 const ALLOWED_EFFORTS = {
   pi: new Set(["low", "medium", "high", "xhigh", "max"]),
   "pi-signed": new Set(["low", "medium", "high", "xhigh", "max"]),
-  grok: new Set(["low", "medium", "high"]),
+  grok: new Set(["low", "medium", "high", "xhigh"]),
   claude: new Set(["low", "medium", "high", "xhigh", "max"]),
 };
-const ROOT_KEYS = new Set(["schema_version", "seed", "presets"]);
+const ROOT_KEYS = new Set(["schema_version", "seed", "default", "presets"]);
 const PRESET_KEYS = new Set(["description", "mode", "candidate", "candidates"]);
 const CANDIDATE_KEYS = new Set([
   "id", "harness", "model", "effort", "fast", "weight", "available", "unavailable_reason",
@@ -51,7 +51,7 @@ function weightUnits(value, where) {
 function validateCandidate(candidate, where, weighted) {
   if (!object(candidate)) fail(`${where} must be an object`);
   exactKeys(candidate, CANDIDATE_KEYS, where);
-  for (const key of ["id", "harness", "model"]) {
+  for (const key of ["id", "harness", "model", "effort"]) {
     if (!nonempty(candidate[key])) fail(`${where} needs non-empty ${key}`);
   }
   if (!/^[A-Za-z0-9._:/+-]+$/.test(candidate.model)) {
@@ -64,17 +64,16 @@ function validateCandidate(candidate, where, weighted) {
     fail(`${where} harness '${candidate.harness}' is not supported by task/model presets`);
   }
   if (candidate.harness === "opencode") {
-    if (Object.hasOwn(candidate, "effort")) {
-      fail(`${where} effort must be omitted for opencode because no verified launch flag enforces one`);
-    }
     if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._:/+-]+$/.test(candidate.model)) {
       fail(`${where} OpenCode model must be an exact provider/model id`);
     }
-  } else {
-    if (!nonempty(candidate.effort)) fail(`${where} needs non-empty effort`);
-    if (!ALLOWED_EFFORTS[candidate.harness].has(candidate.effort)) {
-      fail(`${where} effort '${candidate.effort}' is unsupported for ${candidate.harness}`);
-    }
+  }
+  const efforts = ALLOWED_EFFORTS[candidate.harness];
+  if (efforts && !efforts.has(candidate.effort)) {
+    fail(`${where} effort '${candidate.effort}' is unsupported for ${candidate.harness}`);
+  }
+  if (candidate.harness === "opencode" && !/^[A-Za-z0-9._-]+$/.test(candidate.effort)) {
+    fail(`${where} OpenCode effort must be a model variant token`);
   }
   if (Object.hasOwn(candidate, "fast")) {
     if (candidate.harness !== "pi" && candidate.harness !== "pi-signed") {
@@ -113,6 +112,9 @@ function loadAndValidate(path) {
   if (config.schema_version !== 1) fail("task/model preset config schema_version must be 1");
   if (!object(config.presets) || Object.keys(config.presets).length === 0) {
     fail("task/model preset config needs at least one preset");
+  }
+  if (Object.hasOwn(config, "default") && (!nonempty(config.default) || !Object.hasOwn(config.presets, config.default))) {
+    fail("task/model preset config default must name an existing preset");
   }
   let hasWeighted = false;
   for (const [name, preset] of Object.entries(config.presets)) {
@@ -216,7 +218,14 @@ function stableChoice(config, presetName, taskID) {
 }
 
 function assertChoiceFile(path) {
-  if (!lstatSync(path).isFile()) fail(`durable preset choice ${path} must be a regular file`);
+  let stat;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    stat = lstatSync(path);
+    if (!stat.isFile()) fail(`durable preset choice ${path} must be a single-link regular file`);
+    if (stat.nlink === 1) return;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+  }
+  fail(`durable preset choice ${path} must be a single-link regular file`);
 }
 
 function safeExistingChoice(path, taskID, presetName) {
@@ -271,7 +280,7 @@ if (command === "select") {
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(args.task)) fail("task id is invalid");
   const loaded = loadAndValidate(args.config);
-  const presetName = args.preset;
+  const presetName = args.preset === "default" ? loaded.config.default : args.preset;
   if (!nonempty(presetName) || !Object.hasOwn(loaded.config.presets, presetName)) {
     fail(`task/model preset '${args.preset}' is not configured`);
   }
@@ -301,21 +310,10 @@ if (command === "select") {
       record = safeExistingChoice(choicePath, args.task, presetName);
     }
   }
-  const currentPreset = loaded.config.presets[presetName];
-  const sameSelection = (candidate) => candidate.id === record.selected.id
-    && candidate.harness === record.selected.harness
-    && candidate.model === record.selected.model;
-  let currentCandidate;
-  if (currentPreset.mode === "fixed") {
-    currentCandidate = sameSelection(currentPreset.candidate) ? currentPreset.candidate : null;
-  } else {
-    currentCandidate = currentPreset.candidates.find(sameSelection);
-  }
-  const availability = currentCandidate || record.selected;
-  if (availability.available === false) {
-    fail(`preset '${presetName}' sampled unavailable candidate '${record.selected.id}': ${availability.unavailable_reason}`, 2);
+  if (record.selected.available === false) {
+    fail(`preset '${presetName}' sampled unavailable candidate '${record.selected.id}': ${record.selected.unavailable_reason}`, 2);
   }
   process.stdout.write(`${JSON.stringify(record)}\n`);
   process.exit(0);
 }
-fail("usage: fm-task-model-preset.mjs validate --config <path> | select --config <path> --state-dir <dir> --task <id> --preset <name>");
+fail("usage: fm-task-model-preset.mjs validate --config <path> | select --config <path> --state-dir <dir> --task <id> --preset <name|default>");

@@ -3425,6 +3425,26 @@ if [ "$KIND" != secondmate ]; then
     exit 1
   fi
 fi
+DISPATCH_PRESET=$(fm_meta_get "$META" dispatch_preset)
+if [ -n "$DISPATCH_PRESET" ]; then
+  DISPATCH_CHOICE="$STATE/$ID.dispatch-choice.json"
+  [ -f "$DISPATCH_CHOICE" ] || {
+    echo "error: task $ID records preset '$DISPATCH_PRESET' but its sampled choice is missing; retaining the task record rather than losing comparison provenance" >&2
+    exit 1
+  }
+  if [ "$FORCE" = --force ]; then
+    DISPATCH_OUTCOME=discarded
+  elif [ "$KIND" = scout ]; then
+    DISPATCH_OUTCOME=report-complete
+  else
+    DISPATCH_OUTCOME=landed
+  fi
+  if ! FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
+      "$SCRIPT_DIR/fm-dispatch-metrics.sh" finish "$META" "$DISPATCH_CHOICE" "$DISPATCH_OUTCOME"; then
+    echo "error: task $ID's preset metrics could not be finalized; retaining the task record rather than losing duration and outcome provenance" >&2
+    exit 1
+  fi
+fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   handoff_wake_retire_stage \
@@ -3457,6 +3477,7 @@ rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.progress" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note" \
   "$STATE/$ID.reconcile-nudged" "$STATE/$ID.gemini-settings.json" \
+  "$STATE/$ID.dispatch-choice.json" "$STATE/$ID.dispatch-runtime.json" \
   "$STATE/.$ID.branch-outcome-index"
 # The steering inbox (bin/fm-task-inbox-lib.sh) is runtime state for the
 # retired endpoint; teardown only runs after landing is confirmed, so any

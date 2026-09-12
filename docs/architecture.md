@@ -256,8 +256,10 @@ Secondmate launches are exempt because they resolve the secondmate harness and a
 Unsupported effort values are still recorded in task meta when passed to `fm-spawn.sh`, but the launch template omits any effort flag that the selected harness does not accept.
 That keeps spawn launch compatible across claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, and omp while preserving the requested profile for later audit.
 
-An independent opt-in experiment layer, `config/task-model-presets.json`, maps an already-classified task category to one fixed launch choice or a deterministic weighted draw; `bin/fm-task-model-preset.sh` owns its validation and selection and publishes each complete sample to `state/<id>.dispatch-choice.json` before reporting it, refusing rather than substituting or reweighting when the sampled choice is unavailable.
-The selector is that file's only reader: `fm-spawn.sh` has no preset flag and session-start bootstrap only validates the file, so a preset is never activated implicitly; `docs/configuration.md` "Task/model presets" owns the schema and selection contract.
+An independent opt-in experiment layer in `config/task-model-presets.json` can map an already-classified task category to one fixed choice or a deterministic weighted draw across Pi, Grok, Claude Code, and OpenCode.
+Only an explicit `fm-spawn.sh --preset` activates it, and its selector publishes the complete sample before live adapter validation, then refuses rather than substituting or reweighting when the sampled choice is unavailable.
+Requested and effective launch settings, selection provenance, duration, observed runtime identity, quality annotations, and estimate-labeled cost inputs flow into private `data/dispatch-metrics.jsonl` events.
+[`configuration.md`](configuration.md#taskmodel-presets-configtask-model-presetsjson) owns the schema, adapter constraints, retry behavior, and conservative accounting rules.
 
 ## Optional secondmates
 

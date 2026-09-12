@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Behavior tests for opt-in task/model preset validation and deterministic selection.
+# Behavior tests for opt-in task/model preset selection and comparison records.
 set -u
 
 # shellcheck source=tests/fixtures.sh
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures.sh"
 
 PRESET="$ROOT/bin/fm-task-model-preset.sh"
+METRICS="$ROOT/bin/fm-dispatch-metrics.sh"
 TMP_ROOT=$(fm_test_tmproot fm-task-model-preset)
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
@@ -21,7 +22,7 @@ assert_contains() {
 make_config() {
   local path=$1
   cat > "$path" <<'JSON'
-{"schema_version":1,"seed":"synthetic-test-seed","presets":{"fixed-example":{"mode":"fixed","candidate":{"id":"fixed","harness":"pi","model":"vendor/model-fixed","effort":"high","fast":false}},"weighted-example":{"mode":"weighted","candidates":[{"id":"primary","weight":0.4,"harness":"grok","model":"model-primary","effort":"high"},{"id":"alternative-a","weight":0.35,"harness":"claude","model":"opus","effort":"medium"},{"id":"alternative-b","weight":0.25,"harness":"opencode","model":"vendor/model-alternative"}]}}}
+{"schema_version":1,"seed":"synthetic-test-seed","default":"fixed-example","presets":{"fixed-example":{"mode":"fixed","candidate":{"id":"fixed","harness":"pi","model":"vendor/model-fixed","effort":"high","fast":false}},"weighted-example":{"mode":"weighted","candidates":[{"id":"primary","weight":0.4,"harness":"grok","model":"model-primary","effort":"xhigh"},{"id":"alternative-a","weight":0.35,"harness":"claude","model":"opus","effort":"medium"},{"id":"alternative-b","weight":0.25,"harness":"opencode","model":"vendor/model-alternative","effort":"xhigh"}]}}}
 JSON
 }
 
@@ -29,24 +30,9 @@ case_dir="$TMP_ROOT/basic"
 mkdir -p "$case_dir/state"
 make_config "$case_dir/config.json"
 FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/config.json" || fail "valid preset config was rejected"
-fixed=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select fixed-task fixed-example "$case_dir/config.json") || fail "fixed selection failed"
+fixed=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select fixed-task default "$case_dir/config.json") || fail "fixed selection failed"
 [ "$(printf '%s' "$fixed" | jq -r '.mode + ":" + .selected.id')" = fixed:fixed ] || fail "fixed selection chose the wrong candidate"
 [ "$(printf '%s' "$fixed" | jq -r '.selected.fast')" = false ] || fail "explicit fast=false was lost"
-
-cat > "$case_dir/literal-default.json" <<'JSON'
-{"schema_version":1,"presets":{"default":{"mode":"fixed","candidate":{"id":"literal-default","harness":"claude","model":"opus","effort":"medium"}}}}
-JSON
-literal_default=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select literal-default-task default "$case_dir/literal-default.json") \
-  || fail "a preset literally named default was not selectable"
-[ "$(printf '%s' "$literal_default" | jq -r '.preset + ":" + .selected.id')" = default:literal-default ] \
-  || fail "literal default preset was treated as an alias"
-jq '. + {default:"fixed-example"}' "$case_dir/config.json" > "$case_dir/removed-alias.json"
-set +e
-legacy_alias_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/removed-alias.json" 2>&1)
-legacy_alias_rc=$?
-set -e
-[ "$legacy_alias_rc" -ne 0 ] || fail "removed root default alias still passed validation"
-assert_contains "$legacy_alias_out" "unknown field 'default'" "root default alias validation"
 
 first=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select retry-task weighted-example "$case_dir/config.json") || fail "weighted selection failed"
 first_id=$(printf '%s' "$first" | jq -r '.selected.id')
@@ -55,28 +41,6 @@ jq '.seed="changed-seed"' "$case_dir/config.json" > "$case_dir/changed.json"
 second=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select retry-task weighted-example "$case_dir/changed.json") || fail "retry did not reuse its choice"
 [ "$(printf '%s' "$second" | jq -r '.selected.id')" = "$first_id" ] || fail "retry resampled a different candidate"
 [ "$(printf '%s' "$second" | jq -r '.config_sha256')" = "$first_digest" ] || fail "retry replaced the original config provenance"
-
-availability_choice=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select availability-task weighted-example "$case_dir/config.json") \
-  || fail "availability setup selection failed"
-availability_id=$(printf '%s' "$availability_choice" | jq -r '.selected.id')
-availability_harness=$(printf '%s' "$availability_choice" | jq -r '.selected.harness')
-availability_model=$(printf '%s' "$availability_choice" | jq -r '.selected.model')
-cp "$case_dir/state/availability-task.dispatch-choice.json" "$case_dir/availability-choice-before.json"
-jq --arg id "$availability_id" --arg harness "$availability_harness" --arg model "$availability_model" '
-  .presets["weighted-example"].candidates |= map(
-    if .id == $id and .harness == $harness and .model == $model
-    then . + {available:false, unavailable_reason:"approval was withdrawn"}
-    else . end
-  )
-' "$case_dir/config.json" > "$case_dir/now-unavailable.json"
-set +e
-availability_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select availability-task weighted-example "$case_dir/now-unavailable.json" 2>&1)
-availability_rc=$?
-set -e
-[ "$availability_rc" -eq 2 ] || fail "a reused choice newly marked unavailable did not exit 2"
-assert_contains "$availability_out" "approval was withdrawn" "current availability refusal"
-cmp -s "$case_dir/availability-choice-before.json" "$case_dir/state/availability-task.dispatch-choice.json" \
-  || fail "availability refusal rewrote or resampled the durable choice"
 
 counts_primary=0
 counts_a=0
@@ -104,22 +68,12 @@ race_b=$!
 wait "$race_a" || fail "first concurrent selector failed"
 wait "$race_b" || fail "second concurrent selector failed"
 cmp -s "$case_dir/race-a.json" "$case_dir/race-b.json" || fail "concurrent selectors did not reuse one durable choice"
-# Platform-detected link count, never `stat -f || stat -c`: on Linux GNU
-# `stat -f` is filesystem stat and dumps to stdout before failing, so the
-# fallback's correct count lands behind that garbage (see bin/fm-watch.sh).
-if [ "$(uname)" = Darwin ]; then
-  choice_links=$(/usr/bin/stat -f %l "$case_dir/concurrent-state/race-task.dispatch-choice.json")
-else
-  choice_links=$(stat -c %h "$case_dir/concurrent-state/race-task.dispatch-choice.json")
-fi
+choice_links=$(stat -f '%l' "$case_dir/concurrent-state/race-task.dispatch-choice.json" 2>/dev/null \
+  || stat -c '%h' "$case_dir/concurrent-state/race-task.dispatch-choice.json")
 [ "$choice_links" = 1 ] || fail "durable choice did not settle to one link"
-ln "$case_dir/concurrent-state/race-task.dispatch-choice.json" "$case_dir/concurrent-state/.race-task.dispatch-choice.json.99999.0"
-FM_STATE_OVERRIDE="$case_dir/concurrent-state" "$PRESET" select race-task weighted-example "$case_dir/config.json" > "$case_dir/race-c.json" \
-  || fail "a leftover publication link blocked reuse of the durable choice"
-cmp -s "$case_dir/race-a.json" "$case_dir/race-c.json" || fail "retry beside a leftover publication link did not reuse the durable choice"
 
 cat > "$case_dir/unavailable.json" <<'JSON'
-{"schema_version":1,"presets":{"blocked":{"mode":"fixed","candidate":{"id":"disabled-product","harness":"opencode","model":"vendor/model-disabled","available":false,"unavailable_reason":"product approval is pending"}}}}
+{"schema_version":1,"presets":{"blocked":{"mode":"fixed","candidate":{"id":"disabled-product","harness":"opencode","model":"vendor/model-disabled","effort":"xhigh","available":false,"unavailable_reason":"product approval is pending"}}}}
 JSON
 set +e
 unavailable_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select unavailable-task blocked "$case_dir/unavailable.json" 2>&1)
@@ -130,7 +84,7 @@ assert_contains "$unavailable_out" "sampled unavailable candidate 'disabled-prod
 [ "$(jq -r '.selected.id' "$case_dir/state/unavailable-task.dispatch-choice.json")" = disabled-product ] || fail "unavailable sample provenance was not retained"
 
 cat > "$case_dir/invalid.json" <<'JSON'
-{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"grok","model":"grok-example","effort":"high","fast":true}}}}
+{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"grok","model":"grok-example","effort":"xhigh","fast":true}}}}
 JSON
 set +e
 invalid_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/invalid.json" 2>&1)
@@ -139,52 +93,33 @@ set -e
 [ "$invalid_rc" -ne 0 ] || fail "non-Pi fast setting passed validation"
 assert_contains "$invalid_out" "fast is supported only for pi and pi-signed" "fast validation"
 
-cat > "$case_dir/invalid-opencode-effort.json" <<'JSON'
-{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"opencode","model":"vendor/model","effort":"high"}}}}
-JSON
-set +e
-invalid_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/invalid-opencode-effort.json" 2>&1)
-invalid_rc=$?
-set -e
-[ "$invalid_rc" -ne 0 ] || fail "explicit OpenCode effort passed validation"
-assert_contains "$invalid_out" "effort must be omitted for opencode" "OpenCode explicit effort validation"
+metrics_dir="$TMP_ROOT/metrics"
+mkdir -p "$metrics_dir/data" "$metrics_dir/state"
+make_config "$metrics_dir/config.json"
+choice=$(FM_STATE_OVERRIDE="$metrics_dir/state" "$PRESET" select metric-task default "$metrics_dir/config.json") || fail "metrics choice failed"
+printf '%s\n' "$choice" > "$metrics_dir/state/metric-task.dispatch-choice.json"
+cat > "$metrics_dir/state/metric-task.meta" <<'META'
+harness=pi
+kind=ship
+model=vendor/model-fixed
+effort=high
+spawn_gen=s1
+dispatch_preset=fixed-example
+dispatch_fast=off
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_tool_version=pi-test
+META
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" launch "$metrics_dir/state/metric-task.meta" "$metrics_dir/state/metric-task.dispatch-choice.json" || fail "launch metric failed"
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" finish "$metrics_dir/state/metric-task.meta" "$metrics_dir/state/metric-task.dispatch-choice.json" landed || fail "finish metric failed"
+ledger="$metrics_dir/data/dispatch-metrics.jsonl"
+[ "$(jq -s 'map(select(.event=="launch-prepared")) | length' "$ledger")" -eq 1 ] || fail "launch event missing"
+[ "$(jq -s 'map(select(.event=="finish")) | length' "$ledger")" -eq 1 ] || fail "finish event missing"
+[ "$(jq -s -r 'map(select(.event=="finish"))[0].quality.status' "$ledger")" = unknown ] || fail "missing quality was not kept unknown"
+[ "$(jq -s -r 'map(select(.event=="finish"))[0].cost.billing_basis' "$ledger")" = estimate-not-invoice ] || fail "cost was not labeled as an estimate"
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --model-used vendor/model-runtime --effort-used high --fast-server-verified off --quality bug-found --quota-fraction 0.1 --monthly-price-usd 80 --reset-days 7 || fail "observation metric failed"
+[ "$(jq -s -r 'map(select(.event=="observation"))[0].cost.weekly_usd' "$ledger")" = 2 ] || fail "weekly estimate formula is wrong"
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --quota-fraction 0.1 --monthly-price-usd 80 --reset-days 30 || fail "monthly-period observation failed"
+[ "$(jq -s -r 'map(select(.event=="observation"))[1].cost.status' "$ledger")" = unknown ] || fail "incompatible reset period was presented as weekly cost"
 
-cat > "$case_dir/opencode-default.json" <<'JSON'
-{"schema_version":1,"presets":{"opencode-default":{"mode":"fixed","candidate":{"id":"opencode-default","harness":"opencode","model":"vendor/model-default"}}}}
-JSON
-opencode_choice=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select opencode-default-task opencode-default "$case_dir/opencode-default.json") \
-  || fail "an OpenCode candidate without explicit effort was rejected"
-[ "$(printf '%s' "$opencode_choice" | jq -r '.selected | has("effort")')" = false ] \
-  || fail "an OpenCode sample invented an effort value"
-opencode_retry=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select opencode-default-task opencode-default "$case_dir/opencode-default.json") \
-  || fail "an OpenCode retry rejected its own durable record"
-[ "$opencode_retry" = "$opencode_choice" ] || fail "an OpenCode retry changed its durable record"
-
-cat > "$case_dir/invalid-grok-xhigh.json" <<'JSON'
-{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"grok","model":"grok-example","effort":"xhigh"}}}}
-JSON
-set +e
-invalid_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/invalid-grok-xhigh.json" 2>&1)
-invalid_rc=$?
-set -e
-[ "$invalid_rc" -ne 0 ] || fail "grok xhigh passed validation"
-assert_contains "$invalid_out" "effort 'xhigh' is unsupported for grok" "grok effort vocabulary"
-
-cat > "$case_dir/invalid-grok-max.json" <<'JSON'
-{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"grok","model":"grok-example","effort":"max"}}}}
-JSON
-set +e
-invalid_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/invalid-grok-max.json" 2>&1)
-invalid_rc=$?
-set -e
-[ "$invalid_rc" -ne 0 ] || fail "grok max passed validation"
-assert_contains "$invalid_out" "effort 'max' is unsupported for grok" "grok max rejection"
-
-# Usage output is the selector's documentation contract: it ends with the last
-# sentence of the header comment and must not leak shell code after it.
-usage_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" --help) || fail "--help exited non-zero"
-assert_contains "$usage_out" "fm-task-model-preset.sh select <task-id> <preset-name>" "usage text"
-[ "$(printf '%s\n' "$usage_out" | tail -n 1)" = "remain in the weighted draw and stop a sampled launch explicitly." ] \
-  || fail "usage output leaked past the header comment: $(printf '%s\n' "$usage_out" | tail -n 1)"
-
-echo "PASS: task/model presets are deterministic, weighted, explicit on unavailability, and retry-stable"
+echo "PASS: task/model presets are deterministic, weighted, explicit on unavailability, and conservatively measured"

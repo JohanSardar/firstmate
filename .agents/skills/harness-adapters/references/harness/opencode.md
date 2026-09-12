@@ -1,6 +1,6 @@
 # OpenCode
 
-Verified on 2026-06-11 across versions 1.15.7 through 1.17.6, with busy-queue behavior re-verified on 2026-07-20 using 1.18.4.
+Verified on 2026-06-11 across versions 1.15.7 through 1.17.6, with busy-queue behavior re-verified on 2026-07-20 using 1.18.4 and model variants re-verified on 2026-09-12 using 1.18.28.
 
 ## Operating facts
 
@@ -12,10 +12,12 @@ Verified on 2026-06-11 across versions 1.15.7 through 1.17.6, with busy-queue be
 | Skill invocation | No separate verified form beyond normal slash-command behavior; use natural language when the exact command is uncertain. |
 | Resume | Relaunch with `--continue` to resume the most recent session for the current directory, then send the next instruction after the TUI is ready because `--prompt` does not auto-submit alongside `--continue`. |
 | Model flag | `--model <provider/model>`. |
-| Effort flag | None for Firstmate's interactive `opencode --prompt` launch verified on 1.17.6; `opencode run` has `--variant`, but that is not this path. |
-| Model discovery | Run `opencode models [provider]` to list available provider/model identifiers. |
+| Effort flag | None for the ordinary interactive `opencode --prompt` launch; an opt-in task/model preset uses `opencode run --interactive --auto --variant <level>` after verifying the level in that exact model's verbose variant table. |
+| Model discovery | Run `opencode models [provider]` to list available provider/model identifiers and add `--verbose` for model-specific variants. |
 | Trust dialog | None. |
 
+Preset selection also requires a matching `opencode providers list` credential and never substitutes a similarly named contributor-free or API-billed product.
+The task-local plugin records the model and variant OpenCode reports for later comparison.
 OpenCode can auto-upgrade in the background, and the running TUI can exit mid-task.
 That behavior was observed live during an upgrade from 1.15.7 to 1.17.3.
 If the pane shows the exit banner, use the verified resume path above.

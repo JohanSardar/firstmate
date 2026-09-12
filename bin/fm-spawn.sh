@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--preset <name|default>|--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--preset <name|default>|--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
@@ -43,6 +43,13 @@
 #   the new incarnation. The replacement still never starts outside the copy
 #   holding the work: a Herdr shell that has drifted out of the recorded
 #   worktree is told once to return, and only a shell that will not go refuses.
+#   --preset <name|default> opts this fresh ship or scout into
+#   config/task-model-presets.json. It cannot be combined with explicit harness,
+#   model, or effort axes. bin/fm-task-model-preset.sh validates the fixed or
+#   deterministic weighted choice, records the complete provenance before any
+#   endpoint is created, and reuses that choice on a retry. A sampled unavailable
+#   candidate or unsupported live model/setting refuses rather than falling back.
+#   Ordinary dispatch is unchanged when this flag is absent.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max|ultra> are concrete profile
@@ -219,7 +226,7 @@
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
-#   source of truth; shared --scout/--harness/--model/--effort/--backend/--mode/--yolo
+#   source of truth; shared --scout/--preset/--harness/--model/--effort/--backend/--mode/--yolo
 #   applies to every pair. A ship batch therefore carries one delivery contract, and each
 #   pair still checks it against its own brief; a batch spanning modes is two invocations.
 #   If config/crew-dispatch.json exists, shared --harness is required for crewmate
@@ -263,6 +270,7 @@
 #   Launch templates live in launch_template() below; placeholders replaced before launch:
 #     __BRIEF__    absolute path to data/<task-id>/brief.md
 #     __CLAUDEPERMFLAG__ the claude permission flag selected by config/claude-permission-mode
+#     __SESSIONFLAG__ a preset-only Claude/Grok session UUID for local metrics attribution
 #     __PIBIN__    quoted concrete Pi-family executable path resolved from PATH
 #     __PITUIMODE__ optional --tui-mode regular when that executable advertises it
 #     __TURNEND__  absolute path to state/<task-id>.turn-ended (for harnesses whose
@@ -492,6 +500,7 @@ KIND_SET=0
 HARNESS_ARG=
 MODEL=
 EFFORT=
+PRESET=
 BACKEND_ARG=
 MODE=
 YOLO=
@@ -499,6 +508,7 @@ TRACEPARENT_ARG=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
+PRESET_SET=0
 BACKEND_SET=0
 MODE_SET=0
 YOLO_SET=0
@@ -515,6 +525,7 @@ for a in "$@"; do
       harness) HARNESS_ARG=$a; HARNESS_SET=1 ;;
       model) MODEL=$a; MODEL_SET=1 ;;
       effort) EFFORT=$a; EFFORT_SET=1 ;;
+      preset) PRESET=$a; PRESET_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
@@ -534,6 +545,8 @@ for a in "$@"; do
     --model=*) MODEL=${a#--model=}; MODEL_SET=1 ;;
     --effort) want_value=effort ;;
     --effort=*) EFFORT=${a#--effort=}; EFFORT_SET=1 ;;
+    --preset) want_value=preset ;;
+    --preset=*) PRESET=${a#--preset=}; PRESET_SET=1 ;;
     --backend) want_value=backend ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
     --mode) want_value=mode ;;
@@ -549,6 +562,7 @@ done
 [ "$HARNESS_SET" -eq 0 ] || [ -n "$HARNESS_ARG" ] || { echo "error: --harness requires a non-empty value" >&2; exit 1; }
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
+[ "$PRESET_SET" -eq 0 ] || [ -n "$PRESET" ] || { echo "error: --preset requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
 [ "$MODE_SET" -eq 0 ] || [ -n "$MODE" ] || { echo "error: --mode requires a non-empty value" >&2; exit 1; }
 [ "$YOLO_SET" -eq 0 ] || [ -n "$YOLO" ] || { echo "error: --yolo requires a non-empty value" >&2; exit 1; }
@@ -576,6 +590,7 @@ esac
 # task's own durable record below. Contradicting it on the command line is a
 # refusal rather than a silently-ignored flag.
 if [ "$RELAUNCH" -eq 1 ]; then
+  [ "$PRESET_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded preset choice; --preset cannot resample it" >&2; exit 1; }
   [ "$BACKEND_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded backend; --backend cannot override it" >&2; exit 1; }
   [ "$KIND_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded kind; --scout/--secondmate cannot override it" >&2; exit 1; }
   [ "$MODE_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded delivery mode; --mode cannot override it" >&2; exit 1; }
@@ -1156,7 +1171,7 @@ if [ "$RELAUNCH" -eq 1 ] && [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart"
   exit 1
 fi
 if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in */*) false ;; *) true ;; esac; then
-  if [ "$KIND" != secondmate ] && [ -z "$HARNESS_ARG" ] && [ -f "$CONFIG/crew-dispatch.json" ]; then
+  if [ "$KIND" != secondmate ] && [ -z "$HARNESS_ARG" ] && [ -z "$PRESET" ] && [ -f "$CONFIG/crew-dispatch.json" ]; then
     echo "error: config/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules (the consultation backstop, so the rules are never silently skipped)." >&2
     exit 1
   fi
@@ -1165,6 +1180,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$HARNESS_ARG" ] || shared_args+=(--harness "$HARNESS_ARG")
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
+  [ -z "$PRESET" ] || shared_args+=(--preset "$PRESET")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
   # One delivery contract applies to every pair in a batch, exactly like the shared
   # harness. Each pair still re-validates it against its own brief, so a batch
@@ -1411,6 +1427,85 @@ else
 fi
 [ -z "$HARNESS_ARG" ] || ARG3=$HARNESS_ARG
 
+DISPATCH_PRESET=
+DISPATCH_CHOICE_PATH=
+DISPATCH_MODE=
+DISPATCH_CONFIG_SHA256=
+DISPATCH_SAMPLE_SHA256=
+DISPATCH_FAST=
+DISPATCH_STARTED_AT=
+DISPATCH_STARTED_EPOCH=
+DISPATCH_RUNTIME_SESSION=
+DISPATCH_TOOL_VERSION=
+if [ "$RELAUNCH" -eq 1 ]; then
+  DISPATCH_PRESET=$(fm_meta_get "$RELAUNCH_META" dispatch_preset)
+  if [ -n "$DISPATCH_PRESET" ]; then
+    DISPATCH_CHOICE_PATH="$STATE/$ID.dispatch-choice.json"
+    [ -f "$DISPATCH_CHOICE_PATH" ] || {
+      echo "error: task $ID records preset '$DISPATCH_PRESET' but its durable sampled choice is missing; refusing to relaunch without selection provenance" >&2
+      exit 1
+    }
+    DISPATCH_MODE=$(fm_meta_get "$RELAUNCH_META" dispatch_mode)
+    DISPATCH_CONFIG_SHA256=$(fm_meta_get "$RELAUNCH_META" dispatch_config_sha256)
+    DISPATCH_SAMPLE_SHA256=$(fm_meta_get "$RELAUNCH_META" dispatch_sample_sha256)
+    DISPATCH_FAST=$(fm_meta_get "$RELAUNCH_META" dispatch_fast)
+    DISPATCH_STARTED_AT=$(fm_meta_get "$RELAUNCH_META" dispatch_started_at)
+    DISPATCH_STARTED_EPOCH=$(fm_meta_get "$RELAUNCH_META" dispatch_started_epoch)
+    DISPATCH_RUNTIME_SESSION=$(fm_meta_get "$RELAUNCH_META" dispatch_runtime_session)
+    DISPATCH_TOOL_VERSION=$(fm_meta_get "$RELAUNCH_META" dispatch_tool_version)
+    command -v jq >/dev/null 2>&1 || {
+      echo "error: jq is required to reuse task $ID's durable preset choice" >&2
+      exit 1
+    }
+    [ "$MODEL_SET" -eq 1 ] || MODEL=$(jq -er '.selected.model' "$DISPATCH_CHOICE_PATH")
+    [ "$EFFORT_SET" -eq 1 ] || EFFORT=$(jq -er '.selected.effort' "$DISPATCH_CHOICE_PATH")
+  fi
+elif [ "$PRESET_SET" -eq 1 ]; then
+  [ "$KIND" != secondmate ] || {
+    echo "error: --preset applies only to fresh ship and scout tasks, not secondmates" >&2
+    exit 1
+  }
+  [ "$HARNESS_SET" -eq 0 ] && [ "$MODEL_SET" -eq 0 ] && [ "$EFFORT_SET" -eq 0 ] || {
+    echo "error: --preset cannot be combined with --harness, --model, or --effort; the sampled candidate owns all launch settings" >&2
+    exit 1
+  }
+  [ -z "$ARG3" ] || {
+    echo "error: --preset cannot be combined with a positional harness or raw launch command" >&2
+    exit 1
+  }
+  [ -f "$CONFIG/task-model-presets.json" ] || {
+    echo "error: --preset requires config/task-model-presets.json" >&2
+    exit 1
+  }
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required for task/model preset dispatch" >&2
+    exit 1
+  }
+  if DISPATCH_SELECTION=$("$SCRIPT_DIR/fm-task-model-preset.sh" select "$ID" "$PRESET" "$CONFIG/task-model-presets.json"); then
+    :
+  else
+    dispatch_selection_status=$?
+    exit "$dispatch_selection_status"
+  fi
+  DISPATCH_PRESET=$(printf '%s' "$DISPATCH_SELECTION" | jq -er '.preset') || exit 1
+  DISPATCH_CHOICE_PATH="$STATE/$ID.dispatch-choice.json"
+  DISPATCH_MODE=$(printf '%s' "$DISPATCH_SELECTION" | jq -er '.mode') || exit 1
+  DISPATCH_CONFIG_SHA256=$(printf '%s' "$DISPATCH_SELECTION" | jq -er '.config_sha256') || exit 1
+  DISPATCH_SAMPLE_SHA256=$(printf '%s' "$DISPATCH_SELECTION" | jq -r '.sample_sha256 // ""') || exit 1
+  ARG3=$(printf '%s' "$DISPATCH_SELECTION" | jq -er '.selected.harness') || exit 1
+  MODEL=$(printf '%s' "$DISPATCH_SELECTION" | jq -er '.selected.model') || exit 1
+  EFFORT=$(printf '%s' "$DISPATCH_SELECTION" | jq -er '.selected.effort') || exit 1
+  if printf '%s' "$DISPATCH_SELECTION" | jq -e '.selected | has("fast")' >/dev/null; then
+    if [ "$(printf '%s' "$DISPATCH_SELECTION" | jq -r '.selected.fast')" = true ]; then
+      DISPATCH_FAST=on
+    else
+      DISPATCH_FAST=off
+    fi
+  fi
+  DISPATCH_STARTED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  DISPATCH_STARTED_EPOCH=$(date '+%s')
+fi
+
 shell_quote() {
   printf "'"
   printf '%s' "$1" | sed "s/'/'\\\\''/g"
@@ -1437,6 +1532,120 @@ pi_supports_tui_mode() {
   local executable=$1 help
   help=$("$executable" --help 2>&1) || return 1
   printf '%s\n' "$help" | grep -Eq -- '(^|[[:space:]])--tui-mode([[:space:]=]|$)'
+}
+
+dispatch_validate_live_settings() {
+  local listing row provider model_id details auth help_text provider_label
+  [ -n "$DISPATCH_PRESET" ] || return 0
+  if [ -n "$DISPATCH_FAST" ] && [ "$HARNESS" != pi ] && [ "$HARNESS" != pi-signed ]; then
+    echo "error: preset '$DISPATCH_PRESET' has a Pi fast setting that cannot be carried by relaunch harness '$HARNESS'" >&2
+    return 1
+  fi
+  case "$HARNESS" in
+    pi|pi-signed)
+      listing=$("$PI_BIN" --list-models "$MODEL" 2>&1) || {
+        echo "error: preset '$DISPATCH_PRESET' could not read the selected Pi catalog from $PI_BIN" >&2
+        return 1
+      }
+      row=$(printf '%s\n' "$listing" | awk -v wanted="$MODEL" 'NR > 1 && ($1 "/" $2) == wanted { print; exit }')
+      [ -n "$row" ] || {
+        echo "error: preset '$DISPATCH_PRESET' selected Pi model '$MODEL', which is not in '$PI_BIN --list-models'" >&2
+        return 1
+      }
+      if [ "$EFFORT" != off ] && [ "$(printf '%s\n' "$row" | awk '{print $5}')" != yes ]; then
+        echo "error: preset '$DISPATCH_PRESET' selected Pi effort '$EFFORT' for model '$MODEL', whose catalog does not advertise thinking" >&2
+        return 1
+      fi
+      provider=${MODEL%%/*}
+      [ "$provider" != "$MODEL" ] || {
+        echo "error: preset '$DISPATCH_PRESET' selected Pi model '$MODEL' without an exact provider/model id" >&2
+        return 1
+      }
+      if [ -n "$DISPATCH_FAST" ] && [ "$provider" != openai-codex ]; then
+        echo "error: preset '$DISPATCH_PRESET' selected fast=$DISPATCH_FAST for '$MODEL'; per-worker fast control is verified only for openai-codex models" >&2
+        return 1
+      fi
+      if [ ! -f "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/auth.json" ] \
+        || ! jq -e --arg provider "$provider" 'has($provider)' "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/auth.json" >/dev/null 2>&1; then
+        echo "error: preset '$DISPATCH_PRESET' selected Pi provider '$provider', but no matching authenticated provider record is available" >&2
+        return 1
+      fi
+      DISPATCH_TOOL_VERSION=$("$PI_BIN" --version 2>&1 | head -n 1)
+      ;;
+    grok)
+      listing=$(grok models 2>&1) || {
+        echo "error: preset '$DISPATCH_PRESET' could not read the authenticated Grok model catalog" >&2
+        return 1
+      }
+      printf '%s\n' "$listing" | grep -Fq 'You are logged in' || {
+        echo "error: preset '$DISPATCH_PRESET' selected Grok, but the installed CLI does not report an authenticated account" >&2
+        return 1
+      }
+      printf '%s\n' "$listing" | sed -n 's/^  [*-] //; s/ (default)$//p' | grep -Fxq "$MODEL" || {
+        echo "error: preset '$DISPATCH_PRESET' selected Grok model '$MODEL', which is not in 'grok models'" >&2
+        return 1
+      }
+      DISPATCH_TOOL_VERSION=$(grok --version 2>&1 | head -n 1)
+      ;;
+    claude)
+      help_text=$(claude --help 2>&1) || {
+        echo "error: preset '$DISPATCH_PRESET' could not read Claude Code's launch controls" >&2
+        return 1
+      }
+      printf '%s\n' "$help_text" | grep -Fq "'$MODEL'" || {
+        echo "error: preset '$DISPATCH_PRESET' selected Claude model '$MODEL', which is not a current alias documented by 'claude --help'" >&2
+        return 1
+      }
+      claude auth status --json 2>/dev/null | jq -e '.loggedIn == true' >/dev/null || {
+        echo "error: preset '$DISPATCH_PRESET' selected Claude Code, but 'claude auth status' does not report a usable login" >&2
+        return 1
+      }
+      DISPATCH_TOOL_VERSION=$(claude --version 2>&1 | head -n 1)
+      ;;
+    opencode)
+      provider=${MODEL%%/*}
+      model_id=${MODEL#*/}
+      [ "$provider" != "$MODEL" ] && [ -n "$model_id" ] || {
+        echo "error: preset '$DISPATCH_PRESET' selected OpenCode model '$MODEL' without an exact provider/model id" >&2
+        return 1
+      }
+      listing=$(opencode models "$provider" 2>&1) || {
+        echo "error: preset '$DISPATCH_PRESET' could not read OpenCode provider '$provider'" >&2
+        return 1
+      }
+      printf '%s\n' "$listing" | grep -Fxq "$MODEL" || {
+        echo "error: preset '$DISPATCH_PRESET' selected OpenCode model '$MODEL', which is not in the installed catalog" >&2
+        return 1
+      }
+      details=$(opencode models "$provider" --verbose 2>&1 | awk -v wanted="$MODEL" '
+        $0 == wanted { found=1; next }
+        found && $0 ~ /^[^[:space:]]+\/[A-Za-z0-9]/ { exit }
+        found { print }
+      ')
+      printf '%s\n' "$details" | jq -e --arg effort "$EFFORT" '.variants | type == "object" and has($effort)' >/dev/null 2>&1 || {
+        echo "error: preset '$DISPATCH_PRESET' selected OpenCode effort '$EFFORT', which model '$MODEL' does not advertise as a variant" >&2
+        return 1
+      }
+      case "$provider" in
+        opencode) provider_label='OpenCode Zen' ;;
+        *) provider_label=$(printf '%s' "$provider" | tr '_-' '  ') ;;
+      esac
+      auth=$(opencode providers list 2>&1 | sed $'s/\033\[[0-9;]*m//g') || {
+        echo "error: preset '$DISPATCH_PRESET' could not verify OpenCode credentials" >&2
+        return 1
+      }
+      printf '%s\n' "$auth" | grep -Fiq "$provider_label" || {
+        echo "error: preset '$DISPATCH_PRESET' selected OpenCode provider '$provider', but 'opencode providers list' has no matching credential" >&2
+        return 1
+      }
+      DISPATCH_TOOL_VERSION=$(opencode --version 2>&1 | head -n 1)
+      ;;
+    *)
+      echo "error: preset '$DISPATCH_PRESET' selected unsupported harness '$HARNESS'" >&2
+      return 1
+      ;;
+  esac
+  DISPATCH_TOOL_VERSION=$(printf '%s' "$DISPATCH_TOOL_VERSION" | tr '\r\n' ' ')
 }
 
 # omp pre-launch model validation. `omp models --json` (omp 18.1.11) prints
@@ -1503,7 +1712,7 @@ launch_template() {
     # __CLAUDEPERMFLAG__ is the permission flag config/claude-permission-mode
     # selects (header above): --dangerously-skip-permissions by default, or
     # --permission-mode auto for a captain who refuses bypass mode.
-    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude __CLAUDEPERMFLAG__ --settings '\''{"feedbackDrafts":"off","attribution":{"commit":"","pr":"","sessionUrl":false}}'\'' __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude __CLAUDEPERMFLAG__ --settings '\''{"feedbackDrafts":"off","attribution":{"commit":"","pr":"","sessionUrl":false}}'\'' __SESSIONFLAG____MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     codex)
       if [ "$kind" = secondmate ]; then
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
@@ -1511,7 +1720,13 @@ launch_template() {
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       fi
       ;;
-    opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    opencode)
+      if [ -n "$DISPATCH_PRESET" ]; then
+        printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode run --interactive --auto __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+      else
+        printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+      fi
+      ;;
     pi|pi-signed)
       printf '%s' '__PIBIN____PITUIMODE__'
       if [ "$kind" = secondmate ]; then
@@ -1547,7 +1762,7 @@ launch_template() {
     # --dangerously-skip-permissions. grok's turn-end signal does NOT ride the
     # launch command - it is a Stop-event hook installed below (global hook +
     # per-task pointer), so the template is identical for ship/scout/secondmate.
-    grok) printf '%s' 'grok --always-approve __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    grok) printf '%s' 'grok --always-approve __SESSIONFLAG____MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     # Cursor Agent CLI. --trust suppresses the workspace-trust prompt, which
     # --yolo does NOT cover and which would otherwise block every spawn, since
     # each task gets a fresh worktree path cursor has never seen. --yolo is the
@@ -1790,6 +2005,9 @@ fi
 if [ "$HARNESS" = omp ]; then
   omp_model_validate "$OMP_BIN" "$MODEL" || exit 1
 fi
+if [ -n "$DISPATCH_PRESET" ]; then
+  dispatch_validate_live_settings || exit 1
+fi
 
 secondmate_registry_value() {
   secondmate_registry_field "$DATA/secondmates.md" "$1" "$2"
@@ -1926,13 +2144,19 @@ effort_flag_for_harness() {
       esac
       ;;
     grok)
-      # grok exposes both --effort and --reasoning-effort; firstmate's profile
-      # axis is the reasoning knob. As of grok 0.2.99, --reasoning-effort accepts
-      # only low|medium|high and rejects both xhigh and max, so omit those rather
-      # than passing a known-bad value.
+      # Grok Build 1.0.30 and the current grok-4.6 model support xhigh in
+      # addition to low/medium/high. Max remains unsupported.
       case "$effort" in
-        low|medium|high) printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")" ;;
+        low|medium|high|xhigh) printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")" ;;
       esac
+      ;;
+    opencode)
+      # The ordinary OpenCode TUI has no effort launch flag. An opt-in preset
+      # uses `opencode run --interactive`, whose --variant control is checked
+      # against this exact model's verbose catalog before launch.
+      if [ -n "$DISPATCH_PRESET" ]; then
+        printf -- '--variant %s ' "$(shell_quote "$effort")"
+      fi
       ;;
     pi|pi-signed)
       # Pi 0.80.6 accepts the full shared effort vocabulary, including max, through
@@ -1970,9 +2194,6 @@ effort_flag_for_harness() {
     # --config-override, but that flag is single-value (see
     # rovo_config_override_flag below) so it is built there, merged with the
     # mandatory allowedExternalPaths grant, rather than here.
-    # opencode's interactive `opencode --prompt` launch has a verified --model
-    # flag but no verified effort flag. Its `opencode run --variant` flag belongs
-    # to a different, non-interactive launch mode, so fm-spawn does not pass it.
     # kimi likewise has no reasoning-effort flag; the requested axis stays in
     # task metadata but never reaches the launch command. Cursor encodes effort
     # in model ids such as cursor-grok-4.5-high, so it also receives no separate
@@ -3393,6 +3614,7 @@ EOF
 // never clear the worker's busy state. The session.idle touch stays the
 // watcher's wake NOTIFICATION, never current-state truth.
 import { execFile } from "node:child_process";
+import { renameSync, writeFileSync } from "node:fs";
 const busyEvent = (state, event) =>
   new Promise((resolve) => {
     execFile("$FM_ROOT/bin/fm-busy-event.sh", [
@@ -3402,8 +3624,31 @@ const busyEvent = (state, event) =>
   });
 export const FmBusyState = async () => {
   let activeSession = null;
+  const dispatchPreset = "$DISPATCH_PRESET";
+  const runtimePath = "$STATE_REAL/$ID.dispatch-runtime.json";
+  const persistRuntime = (info) => {
+    if (!dispatchPreset || !info || !info.modelID || !info.providerID) return;
+    const record = {
+      schema_version: 1,
+      task_id: "$ID",
+      preset: dispatchPreset,
+      session_id: info.sessionID || null,
+      model_used: info.providerID + "/" + info.modelID,
+      effort_used: info.variant || "$EFFORT",
+      fast_requested: null,
+      fast_server_verified: false,
+      observed_at: new Date().toISOString(),
+    };
+    const temp = runtimePath + "." + process.pid + ".tmp";
+    writeFileSync(temp, JSON.stringify(record) + "\\n", { mode: 0o600 });
+    renameSync(temp, runtimePath);
+  };
   return {
     event: async ({ event }) => {
+      if (event.type === "message.updated") {
+        persistRuntime(event.properties && event.properties.info);
+        return;
+      }
       if (event.type === "session.status") {
         const sessionID = event.properties.sessionID;
         const statusType = event.properties.status && event.properties.status.type;
@@ -3437,6 +3682,11 @@ EOF
       # Written OUTSIDE the worktree: pi's project-trust gate fires on any extension
       # loaded from inside the project (verified live), but an explicit -e path
       # elsewhere loads without a dialog. Lives in state/, cleaned by teardown.
+      PI_FAST_JS=null
+      case "$DISPATCH_FAST" in
+        on) PI_FAST_JS=true ;;
+        off) PI_FAST_JS=false ;;
+      esac
       cat > "$STATE/$ID.pi-ext.ts" <<EOF
 // Firstmate semantic busy-state events + turn-end notification; written by
 // fm-spawn under the contract owned by bin/fm-busy-lib.sh.
@@ -3449,6 +3699,7 @@ EOF
 // tool calls) and stays a wake NOTIFICATION touch for the watcher, never
 // current-state truth.
 import { execFile } from "node:child_process";
+import { renameSync, writeFileSync } from "node:fs";
 const busyEvent = (state: string, event: string) =>
   new Promise<void>((resolve) => {
     execFile("$FM_ROOT/bin/fm-busy-event.sh", [
@@ -3457,6 +3708,50 @@ const busyEvent = (state: string, event: string) =>
     ], () => resolve());
   });
 export default function (pi: any) {
+  const fastRequested: boolean | null = $PI_FAST_JS;
+  const runtimePath = "$STATE_REAL/$ID.dispatch-runtime.json";
+  const persistRuntime = (ctx: any) => {
+    if (!ctx || !ctx.model || !"$DISPATCH_PRESET") return;
+    const record = {
+      schema_version: 1,
+      task_id: "$ID",
+      preset: "$DISPATCH_PRESET",
+      session_id: ctx.sessionManager?.getSessionId?.() ?? null,
+      session_file: ctx.sessionManager?.getSessionFile?.() ?? null,
+      model_used: ctx.model.provider + "/" + ctx.model.id,
+      effort_used: ctx.thinkingLevel ?? null,
+      fast_requested: fastRequested,
+      fast_server_verified: false,
+      observed_at: new Date().toISOString(),
+    };
+    const temp = runtimePath + "." + process.pid + ".tmp";
+    writeFileSync(temp, JSON.stringify(record) + "\\n", { mode: 0o600 });
+    renameSync(temp, runtimePath);
+  };
+  if ("$DISPATCH_PRESET") {
+  pi.on("session_start", (_event: any, ctx: any) => {
+    persistRuntime(ctx);
+    if (fastRequested !== null) {
+      // Explicit extensions load before user-global extensions. Registering this
+      // rewrite at session start puts it after handlers registered at factory
+      // load, so the per-worker choice wins over an older global fast default.
+      pi.on("before_provider_request", (event: any) => {
+        if (event?.model?.provider !== "openai-codex" || event?.model?.api !== "openai-codex-responses") return;
+        return { ...event.payload, service_tier: fastRequested ? "priority" : "default" };
+      });
+    }
+    pi.appendEntry("fm-dispatch-effective", {
+      task_id: "$ID",
+      preset: "$DISPATCH_PRESET",
+      model_used: ctx.model ? ctx.model.provider + "/" + ctx.model.id : null,
+      effort_used: ctx.thinkingLevel ?? null,
+      fast_requested: fastRequested,
+      fast_server_verified: false,
+    });
+  });
+  pi.on("model_select", (_event: any, ctx: any) => persistRuntime(ctx));
+  pi.on("thinking_level_select", (_event: any, ctx: any) => persistRuntime(ctx));
+  }
   pi.on("agent_start", () => busyEvent("busy", "agent-start"));
   pi.on("agent_settled", (_event: any, ctx: any) => {
     if (ctx && typeof ctx.isIdle === "function" && !ctx.isIdle()) return;
@@ -3688,6 +3983,16 @@ fi
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
+if [ -n "$DISPATCH_PRESET" ]; then
+  case "$HARNESS" in
+    claude|grok)
+      DISPATCH_RUNTIME_SESSION=$(node -e 'process.stdout.write(require("node:crypto").randomUUID())') || {
+        echo "error: could not mint a runtime session id for preset '$DISPATCH_PRESET'" >&2
+        exit 1
+      }
+      ;;
+  esac
+fi
 SPAWN_GEN="s$(date +%s).${BASHPID:-$$}.$RANDOM"
 SPAWN_META_PATH="$STATE/$ID.meta"
 if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
@@ -3705,7 +4010,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx dispatch_preset dispatch_mode dispatch_config_sha256 dispatch_sample_sha256 dispatch_fast dispatch_started_at dispatch_started_epoch dispatch_runtime_session dispatch_tool_version", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -3725,6 +4030,17 @@ preserve_relaunch_meta() {
   echo "effort=${EFFORT:-default}"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
+  if [ -n "$DISPATCH_PRESET" ]; then
+    echo "dispatch_preset=$DISPATCH_PRESET"
+    echo "dispatch_mode=$DISPATCH_MODE"
+    echo "dispatch_config_sha256=$DISPATCH_CONFIG_SHA256"
+    [ -z "$DISPATCH_SAMPLE_SHA256" ] || echo "dispatch_sample_sha256=$DISPATCH_SAMPLE_SHA256"
+    [ -z "$DISPATCH_FAST" ] || echo "dispatch_fast=$DISPATCH_FAST"
+    echo "dispatch_started_at=$DISPATCH_STARTED_AT"
+    echo "dispatch_started_epoch=$DISPATCH_STARTED_EPOCH"
+    [ -z "$DISPATCH_RUNTIME_SESSION" ] || echo "dispatch_runtime_session=$DISPATCH_RUNTIME_SESSION"
+    echo "dispatch_tool_version=$DISPATCH_TOOL_VERSION"
+  fi
   # Default-off writes no traceparent= line.
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;
@@ -3860,6 +4176,9 @@ sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 sq_worktree=$(shell_quote "$WT")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT" "$MODEL") || exit 1
+SESSIONFLAG=
+[ -z "$DISPATCH_RUNTIME_SESSION" ] || SESSIONFLAG="--session-id $(shell_quote "$DISPATCH_RUNTIME_SESSION") "
+LAUNCH=${LAUNCH//__SESSIONFLAG__/$SESSIONFLAG}
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
 LAUNCH=${LAUNCH//__CLAUDEPERMFLAG__/$CLAUDE_PERM_FLAG}
@@ -3956,6 +4275,12 @@ spawn_record_traceparent() {
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
+if [ -n "$DISPATCH_PRESET" ]; then
+  "$SCRIPT_DIR/fm-dispatch-metrics.sh" launch "$STATE/$ID.meta" "$DISPATCH_CHOICE_PATH" || {
+    echo "error: preset '$DISPATCH_PRESET' launch metrics could not be recorded; refusing before the worker launch is delivered" >&2
+    exit 1
+  }
+fi
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
 # Mark the pane as a task worker so bin/fm-test-run.sh can refuse to run the
 # suite in the repository's primary checkout. Ship and scout workers are the

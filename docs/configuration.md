@@ -10,8 +10,8 @@ The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - edit it 
 
 This section is the single owner of the top-level operational-home layout; producer script headers and their help own exact child-file fields and mutation contracts.
 The tracked code root contains the shared instruction, skill, documentation, workflow, and `bin/` surfaces, while each effective `FM_HOME` contains private operational directories.
-`data/` holds durable private fleet records such as the project and secondmate registries, captain preferences, optional shared captain preferences, learnings, backlog, briefs, scout reports, and explicitly installed content-addressed extension packages under `data/extensions/packages/`.
-`state/` holds runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, inactive terminal-outcome receipts under `state/terminal-outcomes/`, enabled extension working namespaces under `state/extensions/`, away-mode state, generated Relay artifacts, parent-side remote ledger copies under `state/secondmate-summary-cache/`, one-shot Bearings reconcile requests under `state/reconcile-notify/`, private secondmate config-reread generations with their retry and quarantine state, per-task steering-inbox records under `state/<id>.inbox/` (`bin/fm-task-inbox-lib.sh`), durable opt-in preset selections in `state/<id>.dispatch-choice.json` (`bin/fm-task-model-preset.sh`), and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
+`data/` holds durable private fleet records such as the project and secondmate registries, captain preferences, optional shared captain preferences, learnings, backlog, briefs, scout reports, the opt-in `dispatch-metrics.jsonl` comparison ledger, and explicitly installed content-addressed extension packages under `data/extensions/packages/`.
+`state/` holds runtime records such as task metadata, append-only status events, per-task preset choices and runtime observations, endpoint signals, watcher and wake-queue coordination, inactive terminal-outcome receipts under `state/terminal-outcomes/`, enabled extension working namespaces under `state/extensions/`, away-mode state, generated Relay artifacts, parent-side remote ledger copies under `state/secondmate-summary-cache/`, one-shot Bearings reconcile requests under `state/reconcile-notify/`, private secondmate config-reread generations with their retry and quarantine state, per-task steering-inbox records under `state/<id>.inbox/` (`bin/fm-task-inbox-lib.sh`), and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
 `config/` holds local gitignored operating choices, including explicit extension bindings under `config/extensions.d/`, and `projects/` holds the local project clones that Firstmate reads but changes only through the narrow guarded and concrete captain-approved exceptions in `AGENTS.md`.
 Untracked files and directories whose names begin with `scratchpad` are also gitignored, so temporary scratch does not make porcelain-based secondmate sync guards treat a home as dirty.
 
@@ -454,9 +454,7 @@ Secondmate homes inherit this file from the primary, so a secondmate's own crewm
 ## Task/model presets (config/task-model-presets.json)
 
 `config/task-model-presets.json` is a separate, optional, gitignored experiment surface for explicit task categories with fixed or weighted launch choices.
-This section is the single owner of its schema and selection contract; `bin/fm-task-model-preset.sh` is its only reader, and that script's header owns the exact commands.
-No spawn path reads the file: `fm-spawn.sh` has no preset flag, session-start bootstrap only validates it, and a preset applies only when firstmate explicitly runs the selector for a named task, so no preset is ever activated implicitly.
-A selected preset is not yet executable or measured: launch wiring, live adapter checks, and the comparison metrics ledger are outside this contract.
+It is inert unless a fresh ship or scout spawn names a configured preset with `fm-spawn.sh --preset <name|default>`.
 Its absence leaves static harness resolution, natural-language crew dispatch, quota-ranked arrays, running workers, and secondmate behavior unchanged.
 The file is deliberately not inherited into secondmate homes: each home opts into its own experiment and keeps its own project memory, credentials, and measurements.
 No task category, candidate, model, product, seed, or weight ships enabled by default.
@@ -467,6 +465,7 @@ The canonical schema is:
 {
   "schema_version": 1,
   "seed": "synthetic-stable-seed",
+  "default": "example-fixed",
   "presets": {
     "example-fixed": {
       "description": "replace with a local task category",
@@ -482,7 +481,7 @@ The canonical schema is:
     "example-weighted": {
       "mode": "weighted",
       "candidates": [
-        { "id": "choice-a", "weight": 1, "harness": "grok", "model": "model-a", "effort": "high" },
+        { "id": "choice-a", "weight": 1, "harness": "grok", "model": "model-a", "effort": "xhigh" },
         { "id": "choice-b", "weight": 1, "harness": "claude", "model": "opus", "effort": "medium" }
       ]
     }
@@ -490,29 +489,40 @@ The canonical schema is:
 }
 ```
 
-`schema_version` must be `1` and `presets` must be a non-empty object.
-Every preset is named explicitly; there is no implicit or alias default, and a root `default` key is rejected as an unknown field.
-Preset and candidate identifiers start with a letter or number and use only letters, numbers, dot, underscore, and dash.
-Every candidate requires `id`, `harness`, and `model`; `harness` must be `pi`, `pi-signed`, `grok`, `claude`, or `opencode`, and `model` is an exact whitespace-free model token, which for `opencode` must be an exact `provider/model` id.
-A candidate also requires `effort` for `pi`, `pi-signed`, `grok`, and `claude`, restricted to the effort values that adapter can enforce: `low`, `medium`, `high`, `xhigh`, and `max` for `pi`, `pi-signed`, and `claude`, and `low`, `medium`, and `high` for `grok`.
-An `opencode` candidate must omit `effort`, because no verified launch flag enforces one.
-It is a schema check only; it consults neither a live model catalog nor the launch-time effort mapping, which the [`harness-adapters`](../.agents/skills/harness-adapters/SKILL.md) references and `bin/fm-spawn.sh` own.
-`fast` is optional and boolean for `pi` and `pi-signed`; it is rejected for every other adapter.
+`schema_version` must be `1`, `presets` must be a non-empty object, and optional `default` must name one preset.
+Preset and candidate identifiers use letters, numbers, dot, underscore, and dash.
+Every candidate requires `id`, `harness`, `model`, and `effort`; presets currently support `pi`, `pi-signed`, `grok`, `claude`, and `opencode` because those are the adapters with verified exact controls.
+Pi `fast` is optional and boolean; it is rejected for every other adapter.
 A candidate may carry `"available": false` only with a non-empty `unavailable_reason`, which is the intended representation for a product awaiting approval.
 Firstmate never substitutes a similarly named free, contributor, API-billed, or differently authenticated product.
 
 A fixed preset has exactly one `candidate` and no weights.
-A weighted preset has at least two uniquely identified `candidates`, each with a positive numeric `weight` of at most six decimal places and at most 1000000, and requires a non-empty top-level `seed`.
+A weighted preset has at least two uniquely identified `candidates`, each with a positive numeric `weight` of at most six decimal places, and requires a non-empty top-level `seed`.
 Selection hashes seed + preset + task id with SHA-256 and maps the first 52 bits into the unmodified sum of configured weights.
-The selected result, candidate table, algorithm, bucket, sample hash, and config hash are written to `state/<id>.dispatch-choice.json` before the selector reports the choice.
-Retries reuse that exact sampled record even if the config changed.
-When the current preset still contains the same candidate id, harness, and model, its current availability is rechecked without changing the recorded sample, so a later `available:false` stops the retry and a later approval can enable the already-selected product.
-Unavailable candidates remain in the draw: if one is sampled, selection stops and retains the sample instead of renormalizing the other weights or counting a fallback as the sample.
+The selected result, candidate table, algorithm, bucket, sample hash, and config hash are written to `state/<id>.dispatch-choice.json` before launch validation.
+Retries reuse that exact record even if the config changed.
+Unavailable candidates remain in the draw: if one is sampled, launch stops and retains the sample instead of renormalizing the other weights or counting a fallback as the sample.
 Use a new task id for a new experimental draw.
 
-When the file exists, bootstrap validates it through `bin/fm-task-model-preset.sh validate`.
-Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstrap emits `BOOTSTRAP_INFO: task/model presets active config/task-model-presets.json`.
-A malformed file is reported as `TASK_MODEL_PRESETS: invalid config/task-model-presets.json - <reason>`, and ordinary dispatch stays available because nothing reads the file implicitly; a missing `node` is reported once through the normal `MISSING: node` flow while the preset check stays silent.
+After selection, spawn rechecks the installed tool's live model and setting surface and its usable login where the CLI exposes one.
+Pi requires an exact catalogued `provider/model` with configured provider credentials; explicit fast on or off is restricted to `openai-codex` and rewrites that worker's provider request to `priority` or `default` without changing global fast state.
+The Pi session records the effective model and thinking level, while fast stays `server_verified:false` until response evidence is supplied.
+Grok requires `grok models` to report both the exact model and a login and now passes its supported `xhigh` reasoning control.
+Claude Code accepts only a current model alias printed by `claude --help`, verifies `claude auth status`, and passes its effort flag.
+OpenCode requires an exact catalogued `provider/model`, verifies the requested effort against that model's verbose variant table and a matching listed credential, then uses `opencode run --interactive --auto --variant` for the preset worker; ordinary OpenCode launches retain their prior command.
+A missing model, variant, credential, or verified fast route stops the selected launch without trying another candidate.
+
+Profiled launches append private JSONL events to `data/dispatch-metrics.jsonl` through `bin/fm-dispatch-metrics.sh`.
+The launch-prepared event records requested versus validated launch settings, tool version, runtime session identity where supported, and complete selection provenance.
+Cleanup appends elapsed task duration, delivery outcome, locally observed effective model data where available, and explicit unknown usage, quality, and cost fields rather than zeros.
+Pi and OpenCode record runtime model observations from their task-local extension or plugin; Claude and Grok use their selected session identity to collect local model/usage metadata at cleanup when the corresponding local record is unambiguous.
+Later model, fast-verification, token usage, and bug/quality observations can be appended with `fm-dispatch-metrics.sh observe`; its help owns the argument shape.
+A subscription estimate is emitted only when quota fraction, monthly price, and a seven-day reset period are all supplied, using `quota_fraction * monthly_price_usd / 4` and the label `estimate-not-invoice`.
+Missing prices, missing usage, shared-pool attribution gaps, unproved server-side fast service, and incompatible reset periods remain unknown.
+Nothing in this ledger is exact billing.
+
+Bootstrap validates a present file and emits `TASK_MODEL_PRESETS: invalid config/task-model-presets.json - ...` on malformed input; valid input is silent unless verbose bootstrap facts are enabled.
+`bin/fm-task-model-preset.sh` owns validation and deterministic selection, `bin/fm-spawn.sh` owns live adapter checks and effective launch controls, and `bin/fm-dispatch-metrics.sh` owns the private comparison ledger.
 
 ## Toolchain
 
