@@ -492,6 +492,7 @@ The canonical schema is:
 `schema_version` must be `1`, `presets` must be a non-empty object, and optional `default` must name one preset.
 Preset and candidate identifiers use letters, numbers, dot, underscore, and dash.
 Every candidate requires `id`, `harness`, `model`, and `effort`; presets currently support `pi`, `pi-signed`, `grok`, `claude`, and `opencode` because those are the adapters with verified exact controls.
+OpenCode effort is restricted to the shared `low`, `medium`, `high`, `xhigh`, and `max` vocabulary so the recorded setting remains safe for the existing relaunch path, then its live model catalog must advertise that exact variant.
 Pi `fast` is optional and boolean; it is rejected for every other adapter.
 A candidate may carry `"available": false` only with a non-empty `unavailable_reason`, which is the intended representation for a product awaiting approval.
 Firstmate never substitutes a similarly named free, contributor, API-billed, or differently authenticated product.
@@ -500,14 +501,15 @@ A fixed preset has exactly one `candidate` and no weights.
 A weighted preset has at least two uniquely identified `candidates`, each with a positive numeric `weight` of at most six decimal places, and requires a non-empty top-level `seed`.
 Selection hashes seed + preset + task id with SHA-256 and maps the first 52 bits into the unmodified sum of configured weights.
 The selected result, candidate table, algorithm, bucket, sample hash, and config hash are written to `state/<id>.dispatch-choice.json` before launch validation.
-Retries reuse that exact record even if the config changed.
+Retries reuse that exact sampled record even if the config changed.
+When the current preset still contains the same candidate id, harness, and model, its current availability is rechecked without changing the recorded sample, so a later `available:false` stops the retry and a later approval can enable the already-selected product.
 Unavailable candidates remain in the draw: if one is sampled, launch stops and retains the sample instead of renormalizing the other weights or counting a fallback as the sample.
 Use a new task id for a new experimental draw.
 
 After selection, spawn rechecks the installed tool's live model and setting surface and its usable login where the CLI exposes one.
 Pi requires an exact catalogued `provider/model` with configured provider credentials; explicit fast on or off is restricted to `openai-codex` and rewrites that worker's provider request to `priority` or `default` without changing global fast state.
 The Pi session records the effective model and thinking level, while fast stays `server_verified:false` until response evidence is supplied.
-Grok requires `grok models` to report both the exact model and a login and now passes its supported `xhigh` reasoning control.
+Grok requires `grok models` to report both the exact model and a login; the explicit preset path may pass its currently verified `xhigh` reasoning control while ordinary dispatch retains its older compatible range.
 Claude Code accepts only a current model alias printed by `claude --help`, verifies `claude auth status`, and passes its effort flag.
 OpenCode requires an exact catalogued `provider/model`, verifies the requested effort against that model's verbose variant table and a matching listed credential, then uses `opencode run --interactive --auto --variant` for the preset worker; ordinary OpenCode launches retain their prior command.
 A missing model, variant, credential, or verified fast route stops the selected launch without trying another candidate.

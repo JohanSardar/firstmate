@@ -1581,7 +1581,7 @@ dispatch_validate_live_settings() {
         echo "error: preset '$DISPATCH_PRESET' selected Grok, but the installed CLI does not report an authenticated account" >&2
         return 1
       }
-      printf '%s\n' "$listing" | sed -n 's/^  [*-] //; s/ (default)$//p' | grep -Fxq "$MODEL" || {
+      printf '%s\n' "$listing" | sed -n 's/^  [*-] //p' | sed 's/ (default)$//' | grep -Fxq "$MODEL" || {
         echo "error: preset '$DISPATCH_PRESET' selected Grok model '$MODEL', which is not in 'grok models'" >&2
         return 1
       }
@@ -2144,10 +2144,13 @@ effort_flag_for_harness() {
       esac
       ;;
     grok)
-      # Grok Build 1.0.30 and the current grok-4.6 model support xhigh in
-      # addition to low/medium/high. Max remains unsupported.
       case "$effort" in
-        low|medium|high|xhigh) printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")" ;;
+        low|medium|high) printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")" ;;
+        xhigh)
+          # Grok Build 1.0.30 supports xhigh for an explicitly sampled preset.
+          # Preserve ordinary dispatch's prior omission on older installations.
+          [ -z "$DISPATCH_PRESET" ] || printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")"
+          ;;
       esac
       ;;
     opencode)
@@ -3634,7 +3637,7 @@ export const FmBusyState = async () => {
       preset: dispatchPreset,
       session_id: info.sessionID || null,
       model_used: info.providerID + "/" + info.modelID,
-      effort_used: info.variant || "$EFFORT",
+      effort_used: info.variant ?? null,
       fast_requested: null,
       fast_server_verified: false,
       observed_at: new Date().toISOString(),

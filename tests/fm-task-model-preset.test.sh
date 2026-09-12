@@ -42,6 +42,28 @@ second=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select retry-task weighte
 [ "$(printf '%s' "$second" | jq -r '.selected.id')" = "$first_id" ] || fail "retry resampled a different candidate"
 [ "$(printf '%s' "$second" | jq -r '.config_sha256')" = "$first_digest" ] || fail "retry replaced the original config provenance"
 
+availability_choice=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select availability-task weighted-example "$case_dir/config.json") \
+  || fail "availability setup selection failed"
+availability_id=$(printf '%s' "$availability_choice" | jq -r '.selected.id')
+availability_harness=$(printf '%s' "$availability_choice" | jq -r '.selected.harness')
+availability_model=$(printf '%s' "$availability_choice" | jq -r '.selected.model')
+cp "$case_dir/state/availability-task.dispatch-choice.json" "$case_dir/availability-choice-before.json"
+jq --arg id "$availability_id" --arg harness "$availability_harness" --arg model "$availability_model" '
+  .presets["weighted-example"].candidates |= map(
+    if .id == $id and .harness == $harness and .model == $model
+    then . + {available:false, unavailable_reason:"approval was withdrawn"}
+    else . end
+  )
+' "$case_dir/config.json" > "$case_dir/now-unavailable.json"
+set +e
+availability_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select availability-task weighted-example "$case_dir/now-unavailable.json" 2>&1)
+availability_rc=$?
+set -e
+[ "$availability_rc" -eq 2 ] || fail "a reused choice newly marked unavailable did not exit 2"
+assert_contains "$availability_out" "approval was withdrawn" "current availability refusal"
+cmp -s "$case_dir/availability-choice-before.json" "$case_dir/state/availability-task.dispatch-choice.json" \
+  || fail "availability refusal rewrote or resampled the durable choice"
+
 counts_primary=0
 counts_a=0
 counts_b=0
@@ -92,6 +114,16 @@ invalid_rc=$?
 set -e
 [ "$invalid_rc" -ne 0 ] || fail "non-Pi fast setting passed validation"
 assert_contains "$invalid_out" "fast is supported only for pi and pi-signed" "fast validation"
+
+cat > "$case_dir/invalid-opencode-effort.json" <<'JSON'
+{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"opencode","model":"vendor/model","effort":"minimal"}}}}
+JSON
+set +e
+invalid_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/invalid-opencode-effort.json" 2>&1)
+invalid_rc=$?
+set -e
+[ "$invalid_rc" -ne 0 ] || fail "OpenCode effort outside the relaunch-safe vocabulary passed validation"
+assert_contains "$invalid_out" "effort 'minimal' is unsupported for opencode" "OpenCode effort validation"
 
 metrics_dir="$TMP_ROOT/metrics"
 mkdir -p "$metrics_dir/data" "$metrics_dir/state"

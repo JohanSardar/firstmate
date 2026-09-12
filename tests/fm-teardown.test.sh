@@ -704,6 +704,63 @@ test_local_only_fork_remote_allows() {
   pass "local-only worktree with HEAD on a fork remote is torn down and the home summary is refreshed"
 }
 
+test_preset_metrics_finish_waits_for_task_record_close() {
+  local case_dir rc real_rm
+  case_dir=$(make_case preset-metrics-close-order)
+  write_meta "$case_dir" local-only ship
+  cat >> "$case_dir/state/task-x1.meta" <<META
+harness=pi
+model=vendor/model-fixed
+effort=high
+dispatch_preset=synthetic-fixed
+dispatch_mode=fixed
+dispatch_config_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+dispatch_fast=off
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=$(date +%s)
+dispatch_tool_version=pi-test
+META
+  cat > "$case_dir/state/task-x1.dispatch-choice.json" <<'JSON'
+{"schema_version":1,"task_id":"task-x1","preset":"synthetic-fixed","config_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mode":"fixed","algorithm":"fixed-v1","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"fixed","weight":null,"available":true}],"selected":{"id":"fixed","harness":"pi","model":"vendor/model-fixed","effort":"high","fast":false}}
+JSON
+  wt_commit "$case_dir" "profiled fix"
+  add_fork_with_pushed_branch "$case_dir"
+
+  # Fail only the authoritative task-record removal after all prior cleanup.
+  # The sampled choice must remain available for an idempotent retry.
+  real_rm=$(command -v rm)
+  cat > "$case_dir/fakebin/rm" <<SH
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  [ "\$arg" != "$case_dir/state/task-x1.meta" ] || exit 1
+done
+exec "$real_rm" "\$@"
+SH
+  chmod +x "$case_dir/fakebin/rm"
+  set +e
+  run_teardown "$case_dir" > "$case_dir/first.stdout" 2> "$case_dir/first.stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "preset metrics: task-record removal failure should refuse cleanup completion"
+  assert_present "$case_dir/state/task-x1.dispatch-choice.json" \
+    "preset metrics: sampled choice was removed before the task record close succeeded"
+  jq -s -e 'map(select(.event == "finish" and .delivery_outcome == "landed")) | length == 1' \
+    "$case_dir/data/dispatch-metrics.jsonl" >/dev/null \
+    || fail "preset metrics: teardown did not append the landed finish outcome"
+
+  /bin/rm -f "$case_dir/fakebin/rm"
+  run_teardown "$case_dir" > "$case_dir/retry.stdout" 2> "$case_dir/retry.stderr" \
+    || fail "preset metrics: retry did not complete from retained provenance"
+  assert_absent "$case_dir/state/task-x1.dispatch-choice.json" \
+    "preset metrics: successful close retained the sampled choice"
+  assert_absent "$case_dir/state/task-x1.dispatch-runtime.json" \
+    "preset metrics: successful close retained runtime observations"
+  jq -s -e 'map(select(.event == "finish" and .delivery_outcome == "landed")) | length == 1' \
+    "$case_dir/data/dispatch-metrics.jsonl" >/dev/null \
+    || fail "preset metrics: retry duplicated or lost the finish outcome"
+  pass "preset metrics finish once and retain sampled provenance until the task record closes"
+}
+
 test_teardown_closes_the_backlog_item_itself() {
   local case_dir out
   case_dir=$(make_case tasks-axi-close)
@@ -3667,6 +3724,7 @@ EOF
 }
 
 test_local_only_fork_remote_allows
+test_preset_metrics_finish_waits_for_task_record_close
 test_teardown_closes_the_backlog_item_itself
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator
 test_local_only_truly_unpushed_refuses

@@ -57,7 +57,7 @@ install_fake_grok() {
   cat > "$fakebin/grok" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
-  models) printf '%s\n' 'You are logged in with example.invalid.' '' 'Available models:' '  * grok-example (default)' ;;
+  models) printf '%s\n' 'You are logged in with example.invalid.' '' 'Available models:' '  * grok-default (default)' '  - grok-example' ;;
   --version) printf '%s\n' 'grok 9.9.9-test' ;;
 esac
 SH
@@ -111,7 +111,37 @@ install_fake_pi "$FAKEBIN_DIR"
 out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-preset-task "$PROJ_DIR" "$DIR/launch.log") || fail "Pi preset spawn failed: $out"
 launch=$(cat "$DIR/launch.log")
 assert_contains "$launch" "--model 'openai-codex/model-pi' --thinking 'max'" "Pi launch settings"
-assert_contains "$(cat "$HOME_DIR/state/pi-preset-task.pi-ext.ts")" 'service_tier: fastRequested ? "priority" : "default"' "Pi fast control"
+cat > "$DIR/assert-pi-fast.mjs" <<'JS'
+import { pathToFileURL } from "node:url";
+const callbacks = new Map();
+const pi = {
+  on(name, callback) {
+    if (!callbacks.has(name)) callbacks.set(name, []);
+    callbacks.get(name).push(callback);
+  },
+  appendEntry() {},
+};
+const extension = await import(pathToFileURL(process.argv[2]).href);
+extension.default(pi);
+const context = {
+  model: { provider: "openai-codex", id: "model-pi" },
+  thinkingLevel: "max",
+  sessionManager: { getSessionId: () => "test-session", getSessionFile: () => null },
+};
+for (const callback of callbacks.get("session_start") || []) await callback({}, context);
+const providerCallbacks = callbacks.get("before_provider_request") || [];
+if (providerCallbacks.length !== 1) throw new Error(`expected one preset provider handler, got ${providerCallbacks.length}`);
+const payload = await providerCallbacks[0]({
+  model: { provider: "openai-codex", api: "openai-codex-responses" },
+  payload: { service_tier: "priority", retained: true },
+});
+if (payload.service_tier !== "default" || payload.retained !== true) {
+  throw new Error(`fast off did not rewrite only service_tier: ${JSON.stringify(payload)}`);
+}
+JS
+node --no-warnings "$DIR/assert-pi-fast.mjs" "$HOME_DIR/state/pi-preset-task.pi-ext.ts" \
+  || fail "generated Pi extension did not apply fast off at runtime"
+[ ! -e "$HOME_DIR/user-home/.pi/agent/settings.json" ] || fail "Pi preset changed global settings"
 [ "$(grep '^dispatch_fast=' "$HOME_DIR/state/pi-preset-task.meta")" = dispatch_fast=off ] || fail "Pi fast effective setting was not recorded"
 [ "$(jq -s -r '.[0].selection.selected_candidate' "$HOME_DIR/data/dispatch-metrics.jsonl")" = candidate ] || fail "Pi launch provenance was not recorded"
 

@@ -12,6 +12,7 @@ const ALLOWED_EFFORTS = {
   "pi-signed": new Set(["low", "medium", "high", "xhigh", "max"]),
   grok: new Set(["low", "medium", "high", "xhigh"]),
   claude: new Set(["low", "medium", "high", "xhigh", "max"]),
+  opencode: new Set(["low", "medium", "high", "xhigh", "max"]),
 };
 const ROOT_KEYS = new Set(["schema_version", "seed", "default", "presets"]);
 const PRESET_KEYS = new Set(["description", "mode", "candidate", "candidates"]);
@@ -310,8 +311,19 @@ if (command === "select") {
       record = safeExistingChoice(choicePath, args.task, presetName);
     }
   }
-  if (record.selected.available === false) {
-    fail(`preset '${presetName}' sampled unavailable candidate '${record.selected.id}': ${record.selected.unavailable_reason}`, 2);
+  const currentPreset = loaded.config.presets[presetName];
+  const sameSelection = (candidate) => candidate.id === record.selected.id
+    && candidate.harness === record.selected.harness
+    && candidate.model === record.selected.model;
+  let currentCandidate;
+  if (currentPreset.mode === "fixed") {
+    currentCandidate = sameSelection(currentPreset.candidate) ? currentPreset.candidate : null;
+  } else {
+    currentCandidate = currentPreset.candidates.find(sameSelection);
+  }
+  const availability = currentCandidate || record.selected;
+  if (availability.available === false) {
+    fail(`preset '${presetName}' sampled unavailable candidate '${record.selected.id}': ${availability.unavailable_reason}`, 2);
   }
   process.stdout.write(`${JSON.stringify(record)}\n`);
   process.exit(0);

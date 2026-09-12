@@ -469,21 +469,23 @@ test_grok_omits_invalid_max_reasoning_effort() {
   pass "grok omits unsupported max reasoning effort"
 }
 
-test_grok_threads_xhigh_reasoning_effort() {
+test_grok_omits_invalid_xhigh_reasoning_effort() {
   local rec id out status launch
   id=profile-grok-xhigh-z6b
   rec=$(make_spawn_case profile-grok-xhigh grok "$id")
   read_case_record "$rec"
 
+  # Ordinary dispatch stays compatible with grok 0.2.99, which rejects xhigh.
   out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model grok-4 --effort xhigh)
   status=$?
-  expect_code 0 "$status" "grok spawn with xhigh reasoning effort should succeed"
+  expect_code 0 "$status" "ordinary grok spawn with xhigh should preserve its prior effort omission"
   assert_meta_profile "$HOME_DIR/state/$id.meta" grok grok-4 xhigh
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "grok --always-approve --model 'grok-4' --reasoning-effort 'xhigh'" \
-    "grok launch did not carry xhigh reasoning effort"
-  assert_contains "$launch" "encode launch-brief" "grok launch did not preserve the typed brief"
-  pass "grok receives supported xhigh reasoning effort"
+  assert_contains "$launch" "grok --always-approve --model 'grok-4' \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < " \
+    "grok launch did not preserve the model flag and typed brief when xhigh effort was omitted"
+  assert_not_contains "$launch" "--reasoning-effort" "ordinary grok launch must omit xhigh for older installations"
+  assert_not_contains "$launch" "--effort" "grok launch must not fall back to --effort for reasoning effort"
+  pass "ordinary grok dispatch preserves its xhigh omission"
 }
 
 test_cursor_threads_model_workspace_and_omits_effort_axis() {
@@ -1311,7 +1313,7 @@ test_codex_threads_model_and_effort
 test_codex_omits_invalid_max_effort
 test_grok_threads_model_and_reasoning_effort
 test_grok_omits_invalid_max_reasoning_effort
-test_grok_threads_xhigh_reasoning_effort
+test_grok_omits_invalid_xhigh_reasoning_effort
 test_cursor_threads_model_workspace_and_omits_effort_axis
 test_cursor_refuses_model_absent_from_live_catalog
 test_cursor_failed_catalog_probe_does_not_block_spawn

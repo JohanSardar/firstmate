@@ -3477,7 +3477,6 @@ rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.progress" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note" \
   "$STATE/$ID.reconcile-nudged" "$STATE/$ID.gemini-settings.json" \
-  "$STATE/$ID.dispatch-choice.json" "$STATE/$ID.dispatch-runtime.json" \
   "$STATE/.$ID.branch-outcome-index"
 # The steering inbox (bin/fm-task-inbox-lib.sh) is runtime state for the
 # retired endpoint; teardown only runs after landing is confirmed, so any
@@ -3514,6 +3513,10 @@ else
     exit 1
   fi
 fi
+# Keep comparison provenance until the authoritative backlog/task close above
+# succeeds. If that close is interrupted, a retry can finalize idempotently
+# instead of finding preset metadata with its sampled choice already gone.
+rm -f "$STATE/$ID.dispatch-choice.json" "$STATE/$ID.dispatch-runtime.json"
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
