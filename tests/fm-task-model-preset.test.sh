@@ -22,7 +22,7 @@ assert_contains() {
 make_config() {
   local path=$1
   cat > "$path" <<'JSON'
-{"schema_version":1,"seed":"synthetic-test-seed","default":"fixed-example","presets":{"fixed-example":{"mode":"fixed","candidate":{"id":"fixed","harness":"pi","model":"vendor/model-fixed","effort":"high","fast":false}},"weighted-example":{"mode":"weighted","candidates":[{"id":"primary","weight":0.4,"harness":"grok","model":"model-primary","effort":"xhigh"},{"id":"alternative-a","weight":0.35,"harness":"claude","model":"opus","effort":"medium"},{"id":"alternative-b","weight":0.25,"harness":"opencode","model":"vendor/model-alternative","effort":"xhigh"}]}}}
+{"schema_version":1,"seed":"synthetic-test-seed","presets":{"fixed-example":{"mode":"fixed","candidate":{"id":"fixed","harness":"pi","model":"vendor/model-fixed","effort":"high","fast":false}},"weighted-example":{"mode":"weighted","candidates":[{"id":"primary","weight":0.4,"harness":"grok","model":"model-primary","effort":"xhigh"},{"id":"alternative-a","weight":0.35,"harness":"claude","model":"opus","effort":"medium"},{"id":"alternative-b","weight":0.25,"harness":"opencode","model":"vendor/model-alternative","effort":"xhigh"}]}}}
 JSON
 }
 
@@ -30,9 +30,24 @@ case_dir="$TMP_ROOT/basic"
 mkdir -p "$case_dir/state"
 make_config "$case_dir/config.json"
 FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/config.json" || fail "valid preset config was rejected"
-fixed=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select fixed-task default "$case_dir/config.json") || fail "fixed selection failed"
+fixed=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select fixed-task fixed-example "$case_dir/config.json") || fail "fixed selection failed"
 [ "$(printf '%s' "$fixed" | jq -r '.mode + ":" + .selected.id')" = fixed:fixed ] || fail "fixed selection chose the wrong candidate"
 [ "$(printf '%s' "$fixed" | jq -r '.selected.fast')" = false ] || fail "explicit fast=false was lost"
+
+cat > "$case_dir/literal-default.json" <<'JSON'
+{"schema_version":1,"presets":{"default":{"mode":"fixed","candidate":{"id":"literal-default","harness":"claude","model":"opus","effort":"medium"}}}}
+JSON
+literal_default=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select literal-default-task default "$case_dir/literal-default.json") \
+  || fail "a preset literally named default was not selectable"
+[ "$(printf '%s' "$literal_default" | jq -r '.preset + ":" + .selected.id')" = default:literal-default ] \
+  || fail "literal default preset was treated as an alias"
+jq '. + {default:"fixed-example"}' "$case_dir/config.json" > "$case_dir/removed-alias.json"
+set +e
+legacy_alias_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/removed-alias.json" 2>&1)
+legacy_alias_rc=$?
+set -e
+[ "$legacy_alias_rc" -ne 0 ] || fail "removed root default alias still passed validation"
+assert_contains "$legacy_alias_out" "unknown field 'default'" "root default alias validation"
 
 first=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select retry-task weighted-example "$case_dir/config.json") || fail "weighted selection failed"
 first_id=$(printf '%s' "$first" | jq -r '.selected.id')
@@ -128,7 +143,7 @@ assert_contains "$invalid_out" "effort 'minimal' is unsupported for opencode" "O
 metrics_dir="$TMP_ROOT/metrics"
 mkdir -p "$metrics_dir/data" "$metrics_dir/state"
 make_config "$metrics_dir/config.json"
-choice=$(FM_STATE_OVERRIDE="$metrics_dir/state" "$PRESET" select metric-task default "$metrics_dir/config.json") || fail "metrics choice failed"
+choice=$(FM_STATE_OVERRIDE="$metrics_dir/state" "$PRESET" select metric-task fixed-example "$metrics_dir/config.json") || fail "metrics choice failed"
 printf '%s\n' "$choice" > "$metrics_dir/state/metric-task.dispatch-choice.json"
 cat > "$metrics_dir/state/metric-task.meta" <<'META'
 harness=pi

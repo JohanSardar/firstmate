@@ -454,7 +454,7 @@ Secondmate homes inherit this file from the primary, so a secondmate's own crewm
 ## Task/model presets (config/task-model-presets.json)
 
 `config/task-model-presets.json` is a separate, optional, gitignored experiment surface for explicit task categories with fixed or weighted launch choices.
-It is inert unless a fresh ship or scout spawn names a configured preset with `fm-spawn.sh --preset <name|default>`.
+It is inert unless a fresh ship or scout spawn names a configured preset with `fm-spawn.sh --preset <name>`.
 Its absence leaves static harness resolution, natural-language crew dispatch, quota-ranked arrays, running workers, and secondmate behavior unchanged.
 The file is deliberately not inherited into secondmate homes: each home opts into its own experiment and keeps its own project memory, credentials, and measurements.
 No task category, candidate, model, product, seed, or weight ships enabled by default.
@@ -465,7 +465,6 @@ The canonical schema is:
 {
   "schema_version": 1,
   "seed": "synthetic-stable-seed",
-  "default": "example-fixed",
   "presets": {
     "example-fixed": {
       "description": "replace with a local task category",
@@ -489,7 +488,8 @@ The canonical schema is:
 }
 ```
 
-`schema_version` must be `1`, `presets` must be a non-empty object, and optional `default` must name one preset.
+`schema_version` must be `1` and `presets` must be a non-empty object.
+Every spawn names one preset explicitly; there is no implicit or alias default.
 Preset and candidate identifiers use letters, numbers, dot, underscore, and dash.
 Every candidate requires `id`, `harness`, `model`, and `effort`; presets currently support `pi`, `pi-signed`, `grok`, `claude`, and `opencode` because those are the adapters with verified exact controls.
 OpenCode effort is restricted to the shared `low`, `medium`, `high`, `xhigh`, and `max` vocabulary so the recorded setting remains safe for the existing relaunch path, then its live model catalog must advertise that exact variant.

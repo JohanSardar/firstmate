@@ -14,7 +14,7 @@ const ALLOWED_EFFORTS = {
   claude: new Set(["low", "medium", "high", "xhigh", "max"]),
   opencode: new Set(["low", "medium", "high", "xhigh", "max"]),
 };
-const ROOT_KEYS = new Set(["schema_version", "seed", "default", "presets"]);
+const ROOT_KEYS = new Set(["schema_version", "seed", "presets"]);
 const PRESET_KEYS = new Set(["description", "mode", "candidate", "candidates"]);
 const CANDIDATE_KEYS = new Set([
   "id", "harness", "model", "effort", "fast", "weight", "available", "unavailable_reason",
@@ -109,9 +109,6 @@ function loadAndValidate(path) {
   if (config.schema_version !== 1) fail("task/model preset config schema_version must be 1");
   if (!object(config.presets) || Object.keys(config.presets).length === 0) {
     fail("task/model preset config needs at least one preset");
-  }
-  if (Object.hasOwn(config, "default") && (!nonempty(config.default) || !Object.hasOwn(config.presets, config.default))) {
-    fail("task/model preset config default must name an existing preset");
   }
   let hasWeighted = false;
   for (const [name, preset] of Object.entries(config.presets)) {
@@ -277,7 +274,7 @@ if (command === "select") {
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(args.task)) fail("task id is invalid");
   const loaded = loadAndValidate(args.config);
-  const presetName = args.preset === "default" ? loaded.config.default : args.preset;
+  const presetName = args.preset;
   if (!nonempty(presetName) || !Object.hasOwn(loaded.config.presets, presetName)) {
     fail(`task/model preset '${args.preset}' is not configured`);
   }
@@ -324,4 +321,4 @@ if (command === "select") {
   process.stdout.write(`${JSON.stringify(record)}\n`);
   process.exit(0);
 }
-fail("usage: fm-task-model-preset.mjs validate --config <path> | select --config <path> --state-dir <dir> --task <id> --preset <name|default>");
+fail("usage: fm-task-model-preset.mjs validate --config <path> | select --config <path> --state-dir <dir> --task <id> --preset <name>");

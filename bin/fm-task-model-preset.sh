@@ -3,7 +3,7 @@
 #
 # Usage:
 #   fm-task-model-preset.sh validate [<config-path>]
-#   fm-task-model-preset.sh select <task-id> <preset-name|default> [<config-path>]
+#   fm-task-model-preset.sh select <task-id> <preset-name> [<config-path>]
 #
 # The default config is $FM_CONFIG_OVERRIDE/task-model-presets.json, otherwise
 # $FM_HOME/config/task-model-presets.json. Selection is deterministic for the
