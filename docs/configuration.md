@@ -517,7 +517,8 @@ A missing model, variant, credential, or verified fast route stops the selected 
 Profiled launches append private JSONL events to `data/dispatch-metrics.jsonl` through `bin/fm-dispatch-metrics.sh`.
 The launch-prepared event records requested versus validated launch settings, tool version, runtime session identity where supported, and complete selection provenance.
 Cleanup appends elapsed task duration, delivery outcome, locally observed effective model data where available, and explicit unknown usage, quality, and cost fields rather than zeros.
-Pi and OpenCode record runtime model observations from their task-local extension or plugin; Claude and Grok use their selected session identity to collect local model/usage metadata at cleanup when the corresponding local record is unambiguous.
+Pi and OpenCode record runtime model observations from their task-local extension or plugin, and the OpenCode plugin records only the worker's main session rather than a subagent child session; Claude and Grok use their selected session identity to collect local model/usage metadata at cleanup when the corresponding local record is unambiguous.
+Claude transcript usage is counted once per assistant message id, because Claude Code repeats one response's usage on every content-block line; a usage line without that id keeps the usage observation unknown.
 Later model, fast-verification, token usage, and bug/quality observations can be appended with `fm-dispatch-metrics.sh observe`; its help owns the argument shape.
 A subscription estimate is emitted only when quota fraction, monthly price, and a seven-day reset period are all supplied, using `quota_fraction * monthly_price_usd / 4` and the label `estimate-not-invoice`.
 Missing prices, missing usage, shared-pool attribution gaps, unproved server-side fast service, and incompatible reset periods remain unknown.

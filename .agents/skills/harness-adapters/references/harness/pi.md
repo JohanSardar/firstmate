@@ -42,6 +42,7 @@ The extension listens for Pi's `turn_end` event, not `agent_end`, so supervision
 Native-harness progress uses the separate generation-bound marker owned by `../../../bin/fm-busy-event.sh`; it never fabricates Pi turn completion.
 For an opt-in preset, the same extension records Pi's active provider/model, effective thinking level, session identity, and explicit fast request.
 Its fast request rewrite is registered at session start so it follows factory-registered global request handlers without changing global configuration; only the selected worker is affected.
+`before_provider_request` reaches a handler as `{type, payload}` with the selected model on the handler context argument, not on the event (verified 0.85.1), so the rewrite reads `ctx.model` and returns the amended `event.payload`.
 Pi sets `PI_CODING_AGENT=true` for its children as its harness-detection marker.
 
 ## Primary integration

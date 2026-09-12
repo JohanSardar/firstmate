@@ -1081,6 +1081,18 @@ fm_backlog_close_marker_remove() {  # <marker-path> <state-dir>
   fm_backlog_atomic_transition remove "$1" "pending-close record" "$2"
 }
 
+# A replayed close is the retry owner for the dispatch provenance teardown
+# retires after its own close; only an id with no task record left is retired,
+# so a live incarnation that reused the id keeps its own files.
+fm_backlog_close_replay_retire_dispatch() {  # <state-dir> <id>
+  local state=$1 id=$2
+  if [ -e "$state/$id.meta" ] || [ -L "$state/$id.meta" ]; then
+    return 0
+  fi
+  fm_backlog_record_remove "$state/$id.dispatch-choice.json" "dispatch choice" "$state" || return 1
+  fm_backlog_record_remove "$state/$id.dispatch-runtime.json" "dispatch runtime observation" "$state"
+}
+
 fm_backlog_close_marker_clear() {  # <state-dir> <id>
   local marker
   marker=$(fm_backlog_close_marker_path "$1" "$2") || return 1
@@ -1152,11 +1164,13 @@ fm_backlog_close_marker_replay() {  # <state-dir> <marker-path> <authorized-data
         # The captain's answer closed the row before this replay; the retained
         # transition owes it nothing more than retiring the record.
         fm_backlog_close_marker_remove "$marker" "$state" || return 1
+        fm_backlog_close_replay_retire_dispatch "$state" "$id" || return 1
         FM_BACKLOG_CLOSE_REPLAY_RESULT=answered
         return 0
       fi
       if fm_backlog_atomic_transition close '' "$marker" "$data" "$id" "$state" \
           "${args[@]+"${args[@]}"}"; then
+        fm_backlog_close_replay_retire_dispatch "$state" "$id" || return 1
         if [ "$cleanup_incomplete" = 1 ]; then
           FM_BACKLOG_CLOSE_REPLAY_RESULT=closed_incomplete
         else
@@ -1168,12 +1182,14 @@ fm_backlog_close_marker_replay() {  # <state-dir> <marker-path> <authorized-data
       ;;
     '')
       fm_backlog_close_marker_remove "$marker" "$state" || return 1
+      fm_backlog_close_replay_retire_dispatch "$state" "$id" || return 1
       FM_BACKLOG_CLOSE_REPLAY_RESULT=stale
       return 0
       ;;
   esac
   if fm_backlog_atomic_transition "$mode" '' "$marker" "$data" "$id" "$state" \
       "${args[@]+"${args[@]}"}"; then
+    fm_backlog_close_replay_retire_dispatch "$state" "$id" || return 1
     if [ "$mode" = retain ]; then
       if [ "$cleanup_incomplete" = 1 ]; then
         FM_BACKLOG_CLOSE_REPLAY_RESULT=retained_incomplete

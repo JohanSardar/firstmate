@@ -119,24 +119,26 @@ const pi = {
     if (!callbacks.has(name)) callbacks.set(name, []);
     callbacks.get(name).push(callback);
   },
-  appendEntry() {},
 };
 const extension = await import(pathToFileURL(process.argv[2]).href);
 extension.default(pi);
 const context = {
-  model: { provider: "openai-codex", id: "model-pi" },
+  model: { provider: "openai-codex", id: "model-pi", api: "openai-codex-responses" },
   thinkingLevel: "max",
-  sessionManager: { getSessionId: () => "test-session", getSessionFile: () => null },
+  sessionManager: { getSessionId: () => "test-session" },
 };
-for (const callback of callbacks.get("session_start") || []) await callback({}, context);
+for (const callback of callbacks.get("session_start") || []) await callback({ type: "session_start" }, context);
 const providerCallbacks = callbacks.get("before_provider_request") || [];
 if (providerCallbacks.length !== 1) throw new Error(`expected one preset provider handler, got ${providerCallbacks.length}`);
-const payload = await providerCallbacks[0]({
-  model: { provider: "openai-codex", api: "openai-codex-responses" },
-  payload: { service_tier: "priority", retained: true },
-});
+// Pi emits { type, payload } and carries the selected model on the handler context.
+const request = { type: "before_provider_request", payload: { service_tier: "priority", retained: true } };
+const payload = await providerCallbacks[0](request, context);
 if (payload.service_tier !== "default" || payload.retained !== true) {
   throw new Error(`fast off did not rewrite only service_tier: ${JSON.stringify(payload)}`);
+}
+const untouched = await providerCallbacks[0](request, { model: { provider: "anthropic", id: "other", api: "anthropic-messages" } });
+if (untouched !== undefined) {
+  throw new Error(`fast off rewrote a request for a non-codex model: ${JSON.stringify(untouched)}`);
 }
 JS
 node --no-warnings "$DIR/assert-pi-fast.mjs" "$HOME_DIR/state/pi-preset-task.pi-ext.ts" \
@@ -173,6 +175,22 @@ install_fake_opencode "$FAKEBIN_DIR"
 out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" opencode-preset-task "$PROJ_DIR" "$DIR/launch.log") || fail "OpenCode preset spawn failed: $out"
 launch=$(cat "$DIR/launch.log")
 assert_contains "$launch" "opencode run --interactive --auto --model 'vendor/model-open' --variant 'xhigh'" "OpenCode variant launch"
+cat > "$DIR/assert-opencode-runtime.mjs" <<'JS'
+import { pathToFileURL } from "node:url";
+const plugin = await import(pathToFileURL(process.argv[2]).href);
+const hooks = await plugin.FmBusyState({});
+const updated = (sessionID, modelID) => hooks.event({ event: { type: "message.updated", properties: {
+  info: { id: `msg_${sessionID}`, sessionID, role: "assistant", providerID: "vendor", modelID },
+} } });
+await hooks.event({ event: { type: "message.updated", properties: { info: { id: "msg_user", sessionID: "ses_main", role: "user" } } } });
+await updated("ses_main", "model-open");
+await updated("ses_child", "model-cheap");
+JS
+node --no-warnings "$DIR/assert-opencode-runtime.mjs" "$WT_DIR/.opencode/plugins/fm-busy-state.js" \
+  || fail "generated OpenCode plugin could not be driven"
+runtime="$HOME_DIR/state/opencode-preset-task.dispatch-runtime.json"
+[ "$(jq -r '.session_id + " " + .model_used + " " + (.effort_used | tostring)' "$runtime")" = "ses_main vendor/model-open null" ] \
+  || fail "OpenCode runtime record was not scoped to the main task session: $(cat "$runtime")"
 
 record=$(make_case opencode-noauth opencode-noauth-task opencode vendor/model-open xhigh)
 IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF

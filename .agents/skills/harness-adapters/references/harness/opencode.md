@@ -17,7 +17,7 @@ Verified on 2026-06-11 across versions 1.15.7 through 1.17.6, with busy-queue be
 | Trust dialog | None. |
 
 Preset selection also requires a matching `opencode providers list` credential and never substitutes a similarly named contributor-free or API-billed product.
-The task-local plugin records the model and variant OpenCode reports for later comparison.
+The task-local plugin records the model and variant OpenCode reports for later comparison, from `message.updated` assistant messages of the first session that produced one (the worker's main session); a subagent child session's messages are ignored, and `AssistantMessage` carries no variant, so the observed effort stays null.
 OpenCode can auto-upgrade in the background, and the running TUI can exit mid-task.
 That behavior was observed live during an upgrade from 1.15.7 to 1.17.3.
 If the pane shows the exit banner, use the verified resume path above.

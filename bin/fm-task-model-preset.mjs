@@ -69,12 +69,8 @@ function validateCandidate(candidate, where, weighted) {
       fail(`${where} OpenCode model must be an exact provider/model id`);
     }
   }
-  const efforts = ALLOWED_EFFORTS[candidate.harness];
-  if (efforts && !efforts.has(candidate.effort)) {
+  if (!ALLOWED_EFFORTS[candidate.harness].has(candidate.effort)) {
     fail(`${where} effort '${candidate.effort}' is unsupported for ${candidate.harness}`);
-  }
-  if (candidate.harness === "opencode" && !/^[A-Za-z0-9._-]+$/.test(candidate.effort)) {
-    fail(`${where} OpenCode effort must be a model variant token`);
   }
   if (Object.hasOwn(candidate, "fast")) {
     if (candidate.harness !== "pi" && candidate.harness !== "pi-signed") {

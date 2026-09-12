@@ -102,7 +102,8 @@ function collectRuntime(choicePath, fields) {
     let speed = null;
     let serviceTier = null;
     const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
-    let responses = 0;
+    const counted = new Set();
+    let unidentified = false;
     for (const line of readFileSync(matches[0], "utf8").split("\n")) {
       if (!line) continue;
       let item;
@@ -112,7 +113,13 @@ function collectRuntime(choicePath, fields) {
       effort = item.effort || effort;
       const usage = item.message.usage;
       if (!object(usage)) continue;
-      responses += 1;
+      const messageID = item.message.id;
+      if (typeof messageID !== "string" || !messageID) {
+        unidentified = true;
+        continue;
+      }
+      if (counted.has(messageID)) continue;
+      counted.add(messageID);
       totals.input_tokens += Number(usage.input_tokens) || 0;
       totals.cache_read_tokens += Number(usage.cache_read_input_tokens) || 0;
       totals.cache_creation_tokens += Number(usage.cache_creation_input_tokens) || 0;
@@ -129,7 +136,9 @@ function collectRuntime(choicePath, fields) {
       effort_used: effort,
       speed,
       service_tier: serviceTier,
-      usage: model ? { status: "recorded-local", kind: "tokens", responses, ...totals, completeness: "not-proven-for-aborted-turns" } : null,
+      usage: !model ? null : unidentified
+        ? { status: "unknown", kind: "tokens", reason: "transcript usage without a stable assistant message id cannot be deduplicated" }
+        : { status: "recorded-local", kind: "tokens", responses: counted.size, ...totals, completeness: "not-proven-for-aborted-turns" },
     };
   }
   if (fields.harness === "grok") {

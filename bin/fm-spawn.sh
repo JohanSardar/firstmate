@@ -3629,13 +3629,16 @@ export const FmBusyState = async () => {
   let activeSession = null;
   const dispatchPreset = "$DISPATCH_PRESET";
   const runtimePath = "$STATE_REAL/$ID.dispatch-runtime.json";
+  let mainSession = null;
   const persistRuntime = (info) => {
-    if (!dispatchPreset || !info || !info.modelID || !info.providerID) return;
+    if (!dispatchPreset || !info || !info.sessionID || !info.modelID || !info.providerID) return;
+    if (mainSession === null) mainSession = info.sessionID;
+    if (info.sessionID !== mainSession) return;
     const record = {
       schema_version: 1,
       task_id: "$ID",
       preset: dispatchPreset,
-      session_id: info.sessionID || null,
+      session_id: info.sessionID,
       model_used: info.providerID + "/" + info.modelID,
       effort_used: info.variant ?? null,
       fast_requested: null,
@@ -3720,7 +3723,6 @@ export default function (pi: any) {
       task_id: "$ID",
       preset: "$DISPATCH_PRESET",
       session_id: ctx.sessionManager?.getSessionId?.() ?? null,
-      session_file: ctx.sessionManager?.getSessionFile?.() ?? null,
       model_used: ctx.model.provider + "/" + ctx.model.id,
       effort_used: ctx.thinkingLevel ?? null,
       fast_requested: fastRequested,
@@ -3738,19 +3740,12 @@ export default function (pi: any) {
       // Explicit extensions load before user-global extensions. Registering this
       // rewrite at session start puts it after handlers registered at factory
       // load, so the per-worker choice wins over an older global fast default.
-      pi.on("before_provider_request", (event: any) => {
-        if (event?.model?.provider !== "openai-codex" || event?.model?.api !== "openai-codex-responses") return;
+      pi.on("before_provider_request", (event: any, requestCtx: any) => {
+        const model = requestCtx?.model;
+        if (model?.provider !== "openai-codex" || model?.api !== "openai-codex-responses") return;
         return { ...event.payload, service_tier: fastRequested ? "priority" : "default" };
       });
     }
-    pi.appendEntry("fm-dispatch-effective", {
-      task_id: "$ID",
-      preset: "$DISPATCH_PRESET",
-      model_used: ctx.model ? ctx.model.provider + "/" + ctx.model.id : null,
-      effort_used: ctx.thinkingLevel ?? null,
-      fast_requested: fastRequested,
-      fast_server_verified: false,
-    });
   });
   pi.on("model_select", (_event: any, ctx: any) => persistRuntime(ctx));
   pi.on("thinking_level_select", (_event: any, ctx: any) => persistRuntime(ctx));

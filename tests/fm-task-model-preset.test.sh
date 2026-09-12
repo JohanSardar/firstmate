@@ -154,4 +154,52 @@ FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --model-used
 FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --quota-fraction 0.1 --monthly-price-usd 80 --reset-days 30 || fail "monthly-period observation failed"
 [ "$(jq -s -r 'map(select(.event=="observation"))[1].cost.status' "$ledger")" = unknown ] || fail "incompatible reset period was presented as weekly cost"
 
+claude_dir="$TMP_ROOT/claude"
+mkdir -p "$claude_dir/data" "$claude_dir/state" "$claude_dir/config/projects/worktree"
+printf '%s\n' '{"schema_version":1,"presets":{"claude-fixed":{"mode":"fixed","candidate":{"id":"opus","harness":"claude","model":"opus","effort":"medium"}}}}' > "$claude_dir/config.json"
+choice=$(FM_STATE_OVERRIDE="$claude_dir/state" "$PRESET" select claude-task claude-fixed "$claude_dir/config.json") || fail "Claude choice failed"
+printf '%s\n' "$choice" > "$claude_dir/state/claude-task.dispatch-choice.json"
+write_claude_meta() {
+  cat > "$claude_dir/state/claude-task.meta" <<META
+harness=claude
+kind=ship
+model=opus
+effort=medium
+spawn_gen=$1
+dispatch_preset=claude-fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_runtime_session=$2
+META
+}
+# Claude Code writes one transcript line per assistant content block; every
+# block of one response repeats the same message.id and the same usage.
+transcript="$claude_dir/config/projects/worktree/11111111-2222-3333-4444-555555555555.jsonl"
+usage_a='{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5,"output_tokens":30,"output_tokens_details":{"thinking_tokens":7},"speed":"standard","service_tier":"priority"}'
+usage_b='{"input_tokens":20,"cache_read_input_tokens":200,"cache_creation_input_tokens":0,"output_tokens":50,"output_tokens_details":{"thinking_tokens":0},"speed":"fast"}'
+{
+  printf '%s\n' '{"type":"user","message":{"role":"user","content":"go"}}'
+  for block in thinking text tool_use; do
+    printf '{"type":"assistant","effort":"medium","message":{"id":"msg_a","model":"claude-opus-5","usage":%s,"content":[{"type":"%s"}]}}\n' "$usage_a" "$block"
+  done
+  printf '{"type":"assistant","effort":"medium","message":{"id":"msg_b","model":"claude-opus-5","usage":%s,"content":[{"type":"text"}]}}\n' "$usage_b"
+} > "$transcript"
+write_claude_meta s1 11111111-2222-3333-4444-555555555555
+CLAUDE_CONFIG_DIR="$claude_dir/config" FM_DATA_OVERRIDE="$claude_dir/data" "$METRICS" finish \
+  "$claude_dir/state/claude-task.meta" "$claude_dir/state/claude-task.dispatch-choice.json" landed || fail "Claude finish metric failed"
+claude_ledger="$claude_dir/data/dispatch-metrics.jsonl"
+observed=$(jq -c -s 'map(select(.event=="finish"))[0].runtime_observed | {model_used, effort_used, speed, service_tier, usage: (.usage | {status, responses, input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, thinking_tokens})}' "$claude_ledger")
+[ "$observed" = '{"model_used":"claude-opus-5","effort_used":"medium","speed":"fast","service_tier":"priority","usage":{"status":"recorded-local","responses":2,"input_tokens":30,"cache_read_tokens":300,"cache_creation_tokens":5,"output_tokens":80,"thinking_tokens":7}}' ] \
+  || fail "Claude transcript usage was not deduplicated by message id: $observed"
+
+# A usage line without a stable message id cannot be deduplicated, so the
+# usage observation stays unknown instead of recording a possibly inflated sum.
+printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":%s,"content":[{"type":"text"}]}}\n' "$usage_b" >> "$transcript"
+write_claude_meta s2 11111111-2222-3333-4444-555555555555
+CLAUDE_CONFIG_DIR="$claude_dir/config" FM_DATA_OVERRIDE="$claude_dir/data" "$METRICS" finish \
+  "$claude_dir/state/claude-task.meta" "$claude_dir/state/claude-task.dispatch-choice.json" landed || fail "Claude unidentified finish metric failed"
+observed=$(jq -c -s 'map(select(.event=="finish"))[1] | {status: .runtime_observed.status, model: .runtime_observed.model_used, usage: .usage.status}' "$claude_ledger")
+[ "$observed" = '{"status":"observed","model":"claude-opus-5","usage":"unknown"}' ] \
+  || fail "Claude usage without message identity was not kept unknown: $observed"
+
 echo "PASS: task/model presets are deterministic, weighted, explicit on unavailability, and conservatively measured"

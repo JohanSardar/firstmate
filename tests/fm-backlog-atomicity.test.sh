@@ -2103,6 +2103,85 @@ test_recovery_retry_preserves_incomplete_cleanup_warning() {
   pass "recovery preserves incomplete-cleanup evidence across a failed replay"
 }
 
+write_preset_provenance() {  # <case-dir> <id>
+  local home
+  home=$(home_of "$1")
+  cat >> "$home/state/$2.meta" <<META
+dispatch_preset=synthetic-fixed
+dispatch_mode=fixed
+dispatch_fast=off
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=$(date +%s)
+META
+  cat > "$home/state/$2.dispatch-choice.json" <<JSON
+{"schema_version":1,"task_id":"$2","preset":"synthetic-fixed","mode":"fixed","algorithm":"fixed-v1","candidates":[{"id":"fixed","weight":null,"available":true}],"selected":{"id":"fixed","harness":"claude","model":"opus","effort":"medium"}}
+JSON
+  cat > "$home/state/$2.dispatch-runtime.json" <<JSON
+{"schema_version":1,"task_id":"$2","preset":"synthetic-fixed","model_used":"anthropic/opus","effort_used":"medium","fast_requested":null,"fast_server_verified":false}
+JSON
+}
+
+test_recovery_retires_preset_provenance_a_failed_close_orphaned() {
+  local case_dir home id out rc=0
+  id=atomic-heal-preset-orphan-b13
+  case_dir=$(make_home heal-preset-orphan)
+  home=$(home_of "$case_dir")
+  add_item "$case_dir" "$id"
+  start_item "$case_dir" "$id"
+  write_task_meta "$case_dir" "$id" ship local-only "spawn_gen=spawn-preset-orphan"
+  write_preset_provenance "$case_dir" "$id"
+  break_verb "$case_dir" done
+
+  out=$(run_teardown "$case_dir" "$id") || rc=$?
+  [ "$rc" -ne 0 ] || fail "a refused backlog close reported success: $out"
+  assert_absent "$home/state/$id.meta" \
+    "the refused close did not reach the task-record removal boundary"
+  assert_present "$home/state/$id.backlog-close" \
+    "the refused close lost its pending record"
+  assert_present "$home/state/$id.dispatch-choice.json" \
+    "the refused close removed the sampled choice before the backlog landed"
+  assert_present "$home/state/$id.dispatch-runtime.json" \
+    "the refused close removed the runtime observation before the backlog landed"
+  rm -f "$case_dir/fakebin/tasks-axi"
+
+  out=$(run_bootstrap "$case_dir")
+  [ "$(row_state "$case_dir" "$id")" = "done" ] \
+    || fail "session start did not finish the refused close: $out"
+  assert_absent "$home/state/$id.backlog-close" \
+    "the replayed close left its record behind"
+  assert_absent "$home/state/$id.dispatch-choice.json" \
+    "the replayed close orphaned the sampled choice"
+  assert_absent "$home/state/$id.dispatch-runtime.json" \
+    "the replayed close orphaned the runtime observation"
+  pass "session start retires the preset provenance a refused close left without an owner"
+}
+
+test_recovery_keeps_preset_provenance_of_a_live_incarnation_on_a_stale_close() {
+  local case_dir home id out
+  id=atomic-heal-preset-live-b13
+  case_dir=$(make_home heal-preset-live)
+  home=$(home_of "$case_dir")
+  add_item "$case_dir" "$id"
+  start_item "$case_dir" "$id"
+  write_task_meta "$case_dir" "$id" ship no-mistakes "spawn_gen=spawn-current"
+  write_preset_provenance "$case_dir" "$id"
+  printf 'id=%s\ndata=%s\nspawn_gen=spawn-previous\narg=--note\narg=local%%20main\n' \
+    "$id" "$home/data" > "$home/state/$id.backlog-close"
+
+  out=$(run_bootstrap "$case_dir")
+  assert_absent "$home/state/$id.backlog-close" \
+    "a stale close for a superseded incarnation was not discarded: $out"
+  assert_present "$home/state/$id.meta" \
+    "a stale close removed the live incarnation's task record"
+  assert_present "$home/state/$id.dispatch-choice.json" \
+    "a stale close removed the live incarnation's sampled choice"
+  assert_present "$home/state/$id.dispatch-runtime.json" \
+    "a stale close removed the live incarnation's runtime observation"
+  [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+    || fail "a stale close changed the live incarnation's backlog row: $out"
+  pass "a stale close never retires the preset provenance of the incarnation that reused its id"
+}
+
 test_recovery_finishes_a_close_for_the_same_meta_incarnation() {
   local case_dir id out
   id=atomic-heal-same-incarnation-b11
@@ -3056,6 +3135,8 @@ test_recovery_replays_a_close_an_interrupted_cleanup_left_open
 test_recovery_backfills_a_recorded_link_on_an_already_done_item
 test_recovery_preserves_a_close_when_the_backlog_cannot_be_read
 test_recovery_retry_preserves_incomplete_cleanup_warning
+test_recovery_retires_preset_provenance_a_failed_close_orphaned
+test_recovery_keeps_preset_provenance_of_a_live_incarnation_on_a_stale_close
 test_recovery_finishes_a_close_for_the_same_meta_incarnation
 test_recovery_preserves_a_close_for_ambiguous_incarnation_metadata
 test_recovery_preserves_both_records_when_meta_removal_fails
