@@ -1097,6 +1097,34 @@ test_crew_dispatch_active_rules_are_verbose_bootstrap_info() {
   pass "bootstrap surfaces active crew-dispatch rules only as verbose BOOTSTRAP_INFO"
 }
 
+test_task_model_preset_bootstrap_validation() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/task-model-presets"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_real_jq "$fakebin"
+  rm -f "$fakebin/node"
+  ln -s "$(command -v node)" "$fakebin/node"
+  cat > "$case_dir/home/config/task-model-presets.json" <<'JSON'
+{"schema_version":1,"seed":"synthetic","presets":{"weighted":{"mode":"weighted","candidates":[{"id":"a","weight":1,"harness":"pi","model":"vendor/model-a","effort":"high"},{"id":"b","weight":1,"harness":"grok","model":"model-b","effort":"xhigh"}]}}}
+JSON
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  [ -z "$out" ] || fail "valid task/model presets should be silent, got: $out"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_BOOTSTRAP_VERBOSE_FACTS=1 FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  [ "$out" = "BOOTSTRAP_INFO: task/model presets active config/task-model-presets.json" ] \
+    || fail "valid task/model preset verbose fact mismatch: $out"
+  printf '%s\n' '{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"grok","model":"model-b","effort":"max"}}}}' \
+    > "$case_dir/home/config/task-model-presets.json"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  printf '%s\n' "$out" | grep -F "TASK_MODEL_PRESETS: invalid config/task-model-presets.json" >/dev/null \
+    || fail "invalid task/model presets were not reported: $out"
+  pass "bootstrap validates opt-in task/model presets without activating them"
+}
+
 test_crew_dispatch_validation() {
   local label body expect mode case_dir fakebin out n
   n=0
@@ -1185,4 +1213,5 @@ test_network_sweeps_recheck_lock_ownership
 test_network_phases_record_per_step_elapsed_times
 test_tasks_axi_verdict_handoff_is_consumed_once
 test_crew_dispatch_active_rules_are_verbose_bootstrap_info
+test_task_model_preset_bootstrap_validation
 test_crew_dispatch_validation

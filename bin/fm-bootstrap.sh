@@ -11,6 +11,7 @@
 #                 "BACKEND_INVALID: <name> (known: <names>)",
 #                 "STARTUP_MEMORY_BUDGET: invalid config/startup-memory-budget - <reason>",
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
+#                 "TASK_MODEL_PRESETS: invalid config/task-model-presets.json - <reason>",
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
 #                 "HOME_SUMMARY: <ledger never published|not republished since
 #                 <stamp>>; <n> failed attempt(s) ... last: <recorded failure>",
@@ -1201,6 +1202,25 @@ crew_dispatch_validate() {
   fi
 }
 
+task_model_presets_validate() {
+  local file err
+  file="$CONFIG/task-model-presets.json"
+  [ -f "$file" ] || return 0
+  if ! command -v node >/dev/null 2>&1; then
+    echo "MISSING: node (install: $(install_cmd node))"
+    return 0
+  fi
+  if err=$("$SCRIPT_DIR/fm-task-model-preset.sh" validate "$file" 2>&1); then
+    if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ]; then
+      echo "BOOTSTRAP_INFO: task/model presets active config/task-model-presets.json"
+    fi
+  else
+    err=${err#error: }
+    err=$(printf '%s' "$err" | head -n 1)
+    echo "TASK_MODEL_PRESETS: invalid config/task-model-presets.json - $err"
+  fi
+}
+
 # Same-home record reconciliation. Every ordinary dispatch and completion now
 # moves the backlog row inside the script that moves the task's record
 # (bin/fm-backlog-transition-lib.sh), so remaining recovery cases include a
@@ -1478,6 +1498,7 @@ detect_local_config() {
     echo "MISSING_MANUAL: cursor-agent (instructions: $(manual_install_url cursor-agent))"
   fi
   crew_dispatch_validate
+  task_model_presets_validate
   if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
     && ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
     echo "BOOTSTRAP_INFO: tasks-axi available"

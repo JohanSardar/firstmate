@@ -256,6 +256,9 @@ Secondmate launches are exempt because they resolve the secondmate harness and a
 Unsupported effort values are still recorded in task meta when passed to `fm-spawn.sh`, but the launch template omits any effort flag that the selected harness does not accept.
 That keeps spawn launch compatible across claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, and omp while preserving the requested profile for later audit.
 
+An independent opt-in experiment layer in `config/task-model-presets.json` can map an already-classified task category to one fixed choice or a deterministic weighted draw across Pi, Grok, Claude Code, and OpenCode.
+Only an explicit `fm-spawn.sh --preset` activates it, and its selector publishes the complete sample before live adapter validation, then refuses rather than substituting or reweighting when the sampled choice is unavailable.
+
 ## Optional secondmates
 
 `data/secondmates.md` records persistent secondmates with natural-language scopes, project clone lists, and home paths.

@@ -451,6 +451,61 @@ Malformed JSON, an empty or malformed rule/default array, an unverified harness,
 While the file remains present, no crewmate or scout spawn may proceed without an explicit resolved harness; malformed configuration must be reported and corrected rather than selected around.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
+## Task/model presets (config/task-model-presets.json)
+
+`config/task-model-presets.json` is a separate, optional, gitignored experiment surface for explicit task categories with fixed or weighted launch choices.
+It is inert unless a fresh ship or scout spawn names a configured preset with `fm-spawn.sh --preset <name>`.
+Its absence leaves static harness resolution, natural-language crew dispatch, quota-ranked arrays, running workers, and secondmate behavior unchanged.
+The file is deliberately not inherited into secondmate homes: each home opts into its own experiment and keeps its own project memory, credentials, and measurements.
+No task category, candidate, model, product, seed, or weight ships enabled by default.
+
+The canonical schema is:
+
+```json
+{
+  "schema_version": 1,
+  "seed": "synthetic-stable-seed",
+  "presets": {
+    "example-fixed": {
+      "description": "replace with a local task category",
+      "mode": "fixed",
+      "candidate": {
+        "id": "fixed-choice",
+        "harness": "pi",
+        "model": "example.invalid/model-fixed",
+        "effort": "high",
+        "fast": false
+      }
+    },
+    "example-weighted": {
+      "mode": "weighted",
+      "candidates": [
+        { "id": "choice-a", "weight": 1, "harness": "grok", "model": "model-a", "effort": "xhigh" },
+        { "id": "choice-b", "weight": 1, "harness": "claude", "model": "opus", "effort": "medium" }
+      ]
+    }
+  }
+}
+```
+
+`schema_version` must be `1` and `presets` must be a non-empty object.
+Every spawn names one preset explicitly; there is no implicit or alias default.
+Preset and candidate identifiers use letters, numbers, dot, underscore, and dash.
+Every candidate requires `id`, `harness`, `model`, and `effort`; presets currently support `pi`, `pi-signed`, `grok`, `claude`, and `opencode` because those are the adapters with verified exact controls.
+OpenCode effort is restricted to the shared `low`, `medium`, `high`, `xhigh`, and `max` vocabulary so the recorded setting remains safe for the existing relaunch path, then its live model catalog must advertise that exact variant.
+Pi `fast` is optional and boolean; it is rejected for every other adapter.
+A candidate may carry `"available": false` only with a non-empty `unavailable_reason`, which is the intended representation for a product awaiting approval.
+Firstmate never substitutes a similarly named free, contributor, API-billed, or differently authenticated product.
+
+A fixed preset has exactly one `candidate` and no weights.
+A weighted preset has at least two uniquely identified `candidates`, each with a positive numeric `weight` of at most six decimal places, and requires a non-empty top-level `seed`.
+Selection hashes seed + preset + task id with SHA-256 and maps the first 52 bits into the unmodified sum of configured weights.
+The selected result, candidate table, algorithm, bucket, sample hash, and config hash are written to `state/<id>.dispatch-choice.json` before launch validation.
+Retries reuse that exact sampled record even if the config changed.
+When the current preset still contains the same candidate id, harness, and model, its current availability is rechecked without changing the recorded sample, so a later `available:false` stops the retry and a later approval can enable the already-selected product.
+Unavailable candidates remain in the draw: if one is sampled, launch stops and retains the sample instead of renormalizing the other weights or counting a fallback as the sample.
+Use a new task id for a new experimental draw.
+
 ## Toolchain
 
 On session start the first mate detects what its required toolchain is missing or too old and lists each problem with either an exact install command or manual instructions.
