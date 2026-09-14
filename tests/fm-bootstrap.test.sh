@@ -1122,6 +1122,15 @@ JSON
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   printf '%s\n' "$out" | grep -F "TASK_MODEL_PRESETS: invalid config/task-model-presets.json" >/dev/null \
     || fail "invalid task/model presets were not reported: $out"
+  # node is already a COMMON_TOOLS requirement, so a home missing node must get
+  # exactly one MISSING diagnostic - the preset validator must not repeat it.
+  rm -f "$fakebin/node"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  [ "$(printf '%s\n' "$out" | grep -c '^MISSING: node ')" -eq 1 ] \
+    || fail "missing node should be reported exactly once, got: $out"
+  printf '%s\n' "$out" | grep -F "TASK_MODEL_PRESETS:" >/dev/null \
+    && fail "preset validation should stay silent without node, got: $out"
   pass "bootstrap validates opt-in task/model presets without activating them"
 }
 

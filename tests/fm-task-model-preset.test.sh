@@ -139,4 +139,11 @@ set -e
 [ "$invalid_rc" -ne 0 ] || fail "OpenCode effort outside the relaunch-safe vocabulary passed validation"
 assert_contains "$invalid_out" "effort 'minimal' is unsupported for opencode" "OpenCode effort validation"
 
+# Usage output is the selector's documentation contract: it ends with the last
+# sentence of the header comment and must not leak shell code after it.
+usage_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" --help) || fail "--help exited non-zero"
+assert_contains "$usage_out" "fm-task-model-preset.sh select <task-id> <preset-name>" "usage text"
+[ "$(printf '%s\n' "$usage_out" | tail -n 1)" = "remain in the weighted draw and stop a sampled launch explicitly." ] \
+  || fail "usage output leaked past the header comment: $(printf '%s\n' "$usage_out" | tail -n 1)"
+
 echo "PASS: task/model presets are deterministic, weighted, explicit on unavailability, and retry-stable"

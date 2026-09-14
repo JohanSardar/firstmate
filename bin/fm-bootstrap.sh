@@ -1206,10 +1206,9 @@ task_model_presets_validate() {
   local file err
   file="$CONFIG/task-model-presets.json"
   [ -f "$file" ] || return 0
-  if ! command -v node >/dev/null 2>&1; then
-    echo "MISSING: node (install: $(install_cmd node))"
-    return 0
-  fi
+  # detect_local_tools already reports a missing node (COMMON_TOOLS), so stay
+  # silent here rather than repeating that diagnostic.
+  command -v node >/dev/null 2>&1 || return 0
   if err=$("$SCRIPT_DIR/fm-task-model-preset.sh" validate "$file" 2>&1); then
     if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ]; then
       echo "BOOTSTRAP_INFO: task/model presets active config/task-model-presets.json"
