@@ -494,6 +494,7 @@ Preset and candidate identifiers use letters, numbers, dot, underscore, and dash
 Every candidate requires `id`, `harness`, `model`, and `effort`; presets currently support `pi`, `pi-signed`, `grok`, `claude`, and `opencode` because those are the adapters with verified exact controls.
 OpenCode effort is restricted to the shared `low`, `medium`, `high`, `xhigh`, and `max` vocabulary so the recorded setting remains safe for the existing relaunch path, then its live model catalog must advertise that exact variant.
 Pi `fast` is optional and boolean; it is rejected for every other adapter.
+No verified launch flag carries Pi fast mode yet, so a sampled `fast: true` stops the spawn rather than launching at the default speed.
 A candidate may carry `"available": false` only with a non-empty `unavailable_reason`, which is the intended representation for a product awaiting approval.
 Firstmate never substitutes a similarly named free, contributor, API-billed, or differently authenticated product.
 
@@ -501,6 +502,7 @@ A fixed preset has exactly one `candidate` and no weights.
 A weighted preset has at least two uniquely identified `candidates`, each with a positive numeric `weight` of at most six decimal places, and requires a non-empty top-level `seed`.
 Selection hashes seed + preset + task id with SHA-256 and maps the first 52 bits into the unmodified sum of configured weights.
 The selected result, candidate table, algorithm, bucket, sample hash, and config hash are written to `state/<id>.dispatch-choice.json` before launch validation.
+The sampled harness, model, and effort then drive the launch exactly as explicit flags would, and the task record `state/<id>.meta` carries `preset=<name>` beside them; `--preset` refuses `--harness`, `--model`, `--effort`, a positional harness or launch command, `--relaunch`, and `--secondmate` rather than letting either side silently win.
 Retries reuse that exact sampled record even if the config changed.
 When the current preset still contains the same candidate id, harness, and model, its current availability is rechecked without changing the recorded sample, so a later `available:false` stops the retry and a later approval can enable the already-selected product.
 Unavailable candidates remain in the draw: if one is sampled, launch stops and retains the sample instead of renormalizing the other weights or counting a fallback as the sample.
