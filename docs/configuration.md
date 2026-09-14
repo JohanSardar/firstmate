@@ -454,7 +454,8 @@ Secondmate homes inherit this file from the primary, so a secondmate's own crewm
 ## Task/model presets (config/task-model-presets.json)
 
 `config/task-model-presets.json` is a separate, optional, gitignored experiment surface for explicit task categories with fixed or weighted launch choices.
-It is inert unless a fresh ship or scout spawn names a configured preset with `fm-spawn.sh --preset <name>`.
+This delivery provides only its schema validation and deterministic selection: `fm-spawn.sh --preset <name>` activation, live adapter checks, and the comparison metrics ledger are explicitly forward-looking and owned by the separate executable-adapter and metrics delivery.
+Until that delivery lands the file stays inert, so no spawn reads it and no preset is activated implicitly.
 Its absence leaves static harness resolution, natural-language crew dispatch, quota-ranked arrays, running workers, and secondmate behavior unchanged.
 The file is deliberately not inherited into secondmate homes: each home opts into its own experiment and keeps its own project memory, credentials, and measurements.
 No task category, candidate, model, product, seed, or weight ships enabled by default.
@@ -489,23 +490,21 @@ The canonical schema is:
 ```
 
 `schema_version` must be `1` and `presets` must be a non-empty object.
-Every spawn names one preset explicitly; there is no implicit or alias default.
+Every preset is named explicitly; there is no implicit or alias default.
 Preset and candidate identifiers use letters, numbers, dot, underscore, and dash.
 Every candidate requires `id`, `harness`, `model`, and `effort`; presets currently support `pi`, `pi-signed`, `grok`, `claude`, and `opencode` because those are the adapters with verified exact controls.
 OpenCode effort is restricted to the shared `low`, `medium`, `high`, `xhigh`, and `max` vocabulary so the recorded setting remains safe for the existing relaunch path, then its live model catalog must advertise that exact variant.
 Pi `fast` is optional and boolean; it is rejected for every other adapter.
-No verified launch flag carries Pi fast mode yet, so a sampled `fast: true` stops the spawn rather than launching at the default speed.
 A candidate may carry `"available": false` only with a non-empty `unavailable_reason`, which is the intended representation for a product awaiting approval.
 Firstmate never substitutes a similarly named free, contributor, API-billed, or differently authenticated product.
 
 A fixed preset has exactly one `candidate` and no weights.
 A weighted preset has at least two uniquely identified `candidates`, each with a positive numeric `weight` of at most six decimal places, and requires a non-empty top-level `seed`.
 Selection hashes seed + preset + task id with SHA-256 and maps the first 52 bits into the unmodified sum of configured weights.
-The selected result, candidate table, algorithm, bucket, sample hash, and config hash are written to `state/<id>.dispatch-choice.json` before launch validation.
-The sampled harness, model, and effort then drive the launch exactly as explicit flags would, and the task record `state/<id>.meta` carries `preset=<name>` beside them; `--preset` refuses `--harness`, `--model`, `--effort`, a positional harness or launch command, `--relaunch`, and `--secondmate` rather than letting either side silently win.
+The selected result, candidate table, algorithm, bucket, sample hash, and config hash are written to `state/<id>.dispatch-choice.json` before any later live adapter validation.
 Retries reuse that exact sampled record even if the config changed.
 When the current preset still contains the same candidate id, harness, and model, its current availability is rechecked without changing the recorded sample, so a later `available:false` stops the retry and a later approval can enable the already-selected product.
-Unavailable candidates remain in the draw: if one is sampled, launch stops and retains the sample instead of renormalizing the other weights or counting a fallback as the sample.
+Unavailable candidates remain in the draw: if one is sampled, selection stops and retains the sample instead of renormalizing the other weights or counting a fallback as the sample.
 Use a new task id for a new experimental draw.
 
 ## Toolchain

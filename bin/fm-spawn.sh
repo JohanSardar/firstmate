@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--preset <name>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--preset <name>] [--backend <name>]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
@@ -51,17 +51,6 @@
 #   from that harness's launch rather than guessed. Ultra is the explicit
 #   exception: bin/fm-harness.sh validate-native-effort owns its model scope;
 #   supported Pi launches receive --codex-effort ultra, never --thinking ultra.
-#   --preset <name> activates one opt-in config/task-model-presets.json entry
-#   for a FRESH ship or scout spawn (docs/configuration.md "Task/model presets").
-#   bin/fm-task-model-preset.sh makes, or on a retry reuses, the task's
-#   deterministic sample and publishes it to state/<id>.dispatch-choice.json
-#   before anything is provisioned; the sampled harness, model, and effort then
-#   drive the launch exactly as explicit flags would. A preset owns those three
-#   axes, so --harness/--model/--effort, a positional harness or launch command,
-#   --relaunch, and --secondmate are refused alongside it. A malformed file,
-#   unknown preset, sampled unavailable candidate, or a sampled Pi fast setting
-#   (no verified launch flag carries it yet) stops the spawn; nothing falls
-#   through to crew-harness, a dispatch profile, or another candidate.
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   exact task only (docs/configuration.md "Runtime backend" owns when that flag
 #   is authorized). Without it, the script resolves FM_BACKEND, then
@@ -230,11 +219,11 @@
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
-#   source of truth; shared --scout/--harness/--model/--effort/--preset/--backend/--mode/--yolo
-#   applies to every pair (each pair draws its own preset sample). A ship batch therefore
-#   carries one delivery contract, and each pair still checks it against its own brief; a
-#   batch spanning modes is two invocations. If config/crew-dispatch.json exists, shared
-#   --harness or --preset is required for crewmate and scout batches. The loop lives here, in bash, so callers never hand-write a
+#   source of truth; shared --scout/--harness/--model/--effort/--backend/--mode/--yolo
+#   applies to every pair. A ship batch therefore carries one delivery contract, and each
+#   pair still checks it against its own brief; a batch spanning modes is two invocations.
+#   If config/crew-dispatch.json exists, shared --harness is required for crewmate
+#   and scout batches. The loop lives here, in bash, so callers never hand-write a
 #   multi-task shell loop (the tool shell is zsh, which does not word-split unquoted
 #   $vars and silently breaks ad-hoc `for ... in $pairs` loops).
 # Launch environment (config/launch-env-allowlist):
@@ -503,7 +492,6 @@ KIND_SET=0
 HARNESS_ARG=
 MODEL=
 EFFORT=
-PRESET_ARG=
 BACKEND_ARG=
 MODE=
 YOLO=
@@ -511,7 +499,6 @@ TRACEPARENT_ARG=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
-PRESET_SET=0
 BACKEND_SET=0
 MODE_SET=0
 YOLO_SET=0
@@ -528,7 +515,6 @@ for a in "$@"; do
       harness) HARNESS_ARG=$a; HARNESS_SET=1 ;;
       model) MODEL=$a; MODEL_SET=1 ;;
       effort) EFFORT=$a; EFFORT_SET=1 ;;
-      preset) PRESET_ARG=$a; PRESET_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
@@ -548,8 +534,6 @@ for a in "$@"; do
     --model=*) MODEL=${a#--model=}; MODEL_SET=1 ;;
     --effort) want_value=effort ;;
     --effort=*) EFFORT=${a#--effort=}; EFFORT_SET=1 ;;
-    --preset) want_value=preset ;;
-    --preset=*) PRESET_ARG=${a#--preset=}; PRESET_SET=1 ;;
     --backend) want_value=backend ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
     --mode) want_value=mode ;;
@@ -565,7 +549,6 @@ done
 [ "$HARNESS_SET" -eq 0 ] || [ -n "$HARNESS_ARG" ] || { echo "error: --harness requires a non-empty value" >&2; exit 1; }
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
-[ "$PRESET_SET" -eq 0 ] || [ -n "$PRESET_ARG" ] || { echo "error: --preset requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
 [ "$MODE_SET" -eq 0 ] || [ -n "$MODE" ] || { echo "error: --mode requires a non-empty value" >&2; exit 1; }
 [ "$YOLO_SET" -eq 0 ] || [ -n "$YOLO" ] || { echo "error: --yolo requires a non-empty value" >&2; exit 1; }
@@ -587,15 +570,6 @@ case "$EFFORT" in
   ''|low|medium|high|xhigh|max|ultra) ;;
   *) echo "error: --effort must be one of low, medium, high, xhigh, max, ultra" >&2; exit 1 ;;
 esac
-# --preset owns the harness, model, and effort axes of a FRESH ship or scout
-# spawn, so a contradicting explicit axis is a refusal rather than a silently
-# ignored flag: a relaunch reuses the task's recorded profile and a secondmate
-# resolves config/secondmate-harness.
-if [ "$PRESET_SET" -eq 1 ]; then
-  [ "$RELAUNCH" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded profile; --preset applies only to a fresh ship or scout spawn" >&2; exit 1; }
-  [ "$KIND" != secondmate ] || { echo "error: --preset applies only to ship and scout spawns; a secondmate resolves config/secondmate-harness" >&2; exit 1; }
-  [ "$HARNESS_SET" -eq 0 ] && [ "$MODEL_SET" -eq 0 ] && [ "$EFFORT_SET" -eq 0 ] || { echo "error: --preset owns the harness, model, and effort axes; drop --harness/--model/--effort or drop --preset" >&2; exit 1; }
-fi
 
 # --relaunch reuses an existing task's endpoint, worktree, project, and kind,
 # so every axis this block resolves for a fresh spawn instead comes from that
@@ -1182,7 +1156,7 @@ if [ "$RELAUNCH" -eq 1 ] && [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart"
   exit 1
 fi
 if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in */*) false ;; *) true ;; esac; then
-  if [ "$KIND" != secondmate ] && [ -z "$HARNESS_ARG" ] && [ -z "$PRESET_ARG" ] && [ -f "$CONFIG/crew-dispatch.json" ]; then
+  if [ "$KIND" != secondmate ] && [ -z "$HARNESS_ARG" ] && [ -f "$CONFIG/crew-dispatch.json" ]; then
     echo "error: config/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules (the consultation backstop, so the rules are never silently skipped)." >&2
     exit 1
   fi
@@ -1191,7 +1165,6 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$HARNESS_ARG" ] || shared_args+=(--harness "$HARNESS_ARG")
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
-  [ -z "$PRESET_ARG" ] || shared_args+=(--preset "$PRESET_ARG")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
   # One delivery contract applies to every pair in a batch, exactly like the shared
   # harness. Each pair still re-validates it against its own brief, so a batch
@@ -1437,23 +1410,6 @@ else
   ARG3=${POS[2]:-}
 fi
 [ -z "$HARNESS_ARG" ] || ARG3=$HARNESS_ARG
-
-# --preset: bin/fm-task-model-preset.sh makes (or, on a retry, reuses) this
-# task's deterministic sample and publishes it to state/<id>.dispatch-choice.json
-# before anything is provisioned. Its refusals - malformed file, unknown preset,
-# sampled unavailable candidate - stop the spawn here; nothing falls through to
-# crew-harness, a dispatch profile, or another candidate.
-if [ "$PRESET_SET" -eq 1 ]; then
-  [ -z "$ARG3" ] || { echo "error: --preset owns this spawn's harness; drop the positional harness or launch command" >&2; exit 1; }
-  PRESET_CHOICE=$(FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" "$SCRIPT_DIR/fm-task-model-preset.sh" select "$ID" "$PRESET_ARG") || exit 1
-  IFS=$'\t' read -r PRESET_CANDIDATE ARG3 MODEL EFFORT PRESET_FAST <<EOF
-$(printf '%s\n' "$PRESET_CHOICE" | jq -r '.selected | [.id, .harness, .model, .effort, (.fast == true)] | @tsv' 2>/dev/null)
-EOF
-  [ -n "$ARG3" ] && [ -n "$MODEL" ] && [ -n "$EFFORT" ] || { echo "error: preset '$PRESET_ARG' returned an unreadable selection for task $ID" >&2; exit 1; }
-  # No verified adapter flag carries Pi fast mode yet, so a sampled fast=true
-  # stops rather than launching at the default speed.
-  [ "$PRESET_FAST" != true ] || { echo "error: preset '$PRESET_ARG' sampled candidate '$PRESET_CANDIDATE' with fast=true, but no verified launch flag carries Pi fast mode; refusing rather than launching at the default speed" >&2; exit 1; }
-fi
 
 shell_quote() {
   printf "'"
@@ -3767,7 +3723,6 @@ preserve_relaunch_meta() {
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
-  [ -z "$PRESET_ARG" ] || echo "preset=$PRESET_ARG"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
   # Default-off writes no traceparent= line.

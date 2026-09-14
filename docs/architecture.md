@@ -257,7 +257,7 @@ Unsupported effort values are still recorded in task meta when passed to `fm-spa
 That keeps spawn launch compatible across claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, and omp while preserving the requested profile for later audit.
 
 An independent opt-in experiment layer in `config/task-model-presets.json` can map an already-classified task category to one fixed choice or a deterministic weighted draw across Pi, Grok, Claude Code, and OpenCode.
-Only an explicit `fm-spawn.sh --preset` activates it, and its selector publishes the complete sample before live adapter validation, then refuses rather than substituting or reweighting when the sampled choice is unavailable.
+This delivery provides only that schema and deterministic selection: the selector publishes the complete sample to `state/<id>.dispatch-choice.json` and refuses rather than substituting or reweighting when the sampled choice is unavailable, while `fm-spawn.sh --preset` activation, live adapter validation, and the comparison metrics ledger are explicitly forward-looking and owned by the separate executable-adapter and metrics delivery.
 
 ## Optional secondmates
 
