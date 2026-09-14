@@ -21,7 +21,7 @@ assert_contains() {
 make_config() {
   local path=$1
   cat > "$path" <<'JSON'
-{"schema_version":1,"seed":"synthetic-test-seed","presets":{"fixed-example":{"mode":"fixed","candidate":{"id":"fixed","harness":"pi","model":"vendor/model-fixed","effort":"high","fast":false}},"weighted-example":{"mode":"weighted","candidates":[{"id":"primary","weight":0.4,"harness":"grok","model":"model-primary","effort":"xhigh"},{"id":"alternative-a","weight":0.35,"harness":"claude","model":"opus","effort":"medium"},{"id":"alternative-b","weight":0.25,"harness":"opencode","model":"vendor/model-alternative","effort":"xhigh"}]}}}
+{"schema_version":1,"seed":"synthetic-test-seed","presets":{"fixed-example":{"mode":"fixed","candidate":{"id":"fixed","harness":"pi","model":"vendor/model-fixed","effort":"high","fast":false}},"weighted-example":{"mode":"weighted","candidates":[{"id":"primary","weight":0.4,"harness":"grok","model":"model-primary","effort":"high"},{"id":"alternative-a","weight":0.35,"harness":"claude","model":"opus","effort":"medium"},{"id":"alternative-b","weight":0.25,"harness":"opencode","model":"vendor/model-alternative"}]}}}
 JSON
 }
 
@@ -109,7 +109,7 @@ choice_links=$(stat -f '%l' "$case_dir/concurrent-state/race-task.dispatch-choic
 [ "$choice_links" = 1 ] || fail "durable choice did not settle to one link"
 
 cat > "$case_dir/unavailable.json" <<'JSON'
-{"schema_version":1,"presets":{"blocked":{"mode":"fixed","candidate":{"id":"disabled-product","harness":"opencode","model":"vendor/model-disabled","effort":"xhigh","available":false,"unavailable_reason":"product approval is pending"}}}}
+{"schema_version":1,"presets":{"blocked":{"mode":"fixed","candidate":{"id":"disabled-product","harness":"opencode","model":"vendor/model-disabled","available":false,"unavailable_reason":"product approval is pending"}}}}
 JSON
 set +e
 unavailable_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select unavailable-task blocked "$case_dir/unavailable.json" 2>&1)
@@ -120,7 +120,7 @@ assert_contains "$unavailable_out" "sampled unavailable candidate 'disabled-prod
 [ "$(jq -r '.selected.id' "$case_dir/state/unavailable-task.dispatch-choice.json")" = disabled-product ] || fail "unavailable sample provenance was not retained"
 
 cat > "$case_dir/invalid.json" <<'JSON'
-{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"grok","model":"grok-example","effort":"xhigh","fast":true}}}}
+{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"grok","model":"grok-example","effort":"high","fast":true}}}}
 JSON
 set +e
 invalid_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/invalid.json" 2>&1)
@@ -130,14 +130,45 @@ set -e
 assert_contains "$invalid_out" "fast is supported only for pi and pi-signed" "fast validation"
 
 cat > "$case_dir/invalid-opencode-effort.json" <<'JSON'
-{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"opencode","model":"vendor/model","effort":"minimal"}}}}
+{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"opencode","model":"vendor/model","effort":"high"}}}}
 JSON
 set +e
 invalid_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/invalid-opencode-effort.json" 2>&1)
 invalid_rc=$?
 set -e
-[ "$invalid_rc" -ne 0 ] || fail "OpenCode effort outside the relaunch-safe vocabulary passed validation"
-assert_contains "$invalid_out" "effort 'minimal' is unsupported for opencode" "OpenCode effort validation"
+[ "$invalid_rc" -ne 0 ] || fail "explicit OpenCode effort passed validation"
+assert_contains "$invalid_out" "effort must be omitted for opencode" "OpenCode explicit effort validation"
+
+cat > "$case_dir/opencode-default.json" <<'JSON'
+{"schema_version":1,"presets":{"opencode-default":{"mode":"fixed","candidate":{"id":"opencode-default","harness":"opencode","model":"vendor/model-default"}}}}
+JSON
+opencode_choice=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select opencode-default-task opencode-default "$case_dir/opencode-default.json") \
+  || fail "an OpenCode candidate without explicit effort was rejected"
+[ "$(printf '%s' "$opencode_choice" | jq -r '.selected | has("effort")')" = false ] \
+  || fail "an OpenCode sample invented an effort value"
+opencode_retry=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" select opencode-default-task opencode-default "$case_dir/opencode-default.json") \
+  || fail "an OpenCode retry rejected its own durable record"
+[ "$opencode_retry" = "$opencode_choice" ] || fail "an OpenCode retry changed its durable record"
+
+cat > "$case_dir/invalid-grok-xhigh.json" <<'JSON'
+{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"grok","model":"grok-example","effort":"xhigh"}}}}
+JSON
+set +e
+invalid_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/invalid-grok-xhigh.json" 2>&1)
+invalid_rc=$?
+set -e
+[ "$invalid_rc" -ne 0 ] || fail "grok xhigh passed validation"
+assert_contains "$invalid_out" "effort 'xhigh' is unsupported for grok" "grok effort vocabulary"
+
+cat > "$case_dir/invalid-grok-max.json" <<'JSON'
+{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"grok","model":"grok-example","effort":"max"}}}}
+JSON
+set +e
+invalid_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/invalid-grok-max.json" 2>&1)
+invalid_rc=$?
+set -e
+[ "$invalid_rc" -ne 0 ] || fail "grok max passed validation"
+assert_contains "$invalid_out" "effort 'max' is unsupported for grok" "grok max rejection"
 
 # Usage output is the selector's documentation contract: it ends with the last
 # sentence of the header comment and must not leak shell code after it.

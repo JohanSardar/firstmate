@@ -493,8 +493,9 @@ The canonical schema is:
 `schema_version` must be `1` and `presets` must be a non-empty object.
 Every preset is named explicitly; there is no implicit or alias default, and a root `default` key is rejected as an unknown field.
 Preset and candidate identifiers start with a letter or number and use only letters, numbers, dot, underscore, and dash.
-Every candidate requires `id`, `harness`, `model`, and `effort`; `harness` must be `pi`, `pi-signed`, `grok`, `claude`, or `opencode`, and `model` is an exact whitespace-free model token, which for `opencode` must be an exact `provider/model` id.
-The validator accepts only the shared effort vocabulary that the launch and relaunch paths already accept: `low`, `medium`, `high`, `xhigh`, and `max` for `pi`, `pi-signed`, `claude`, and `opencode`, and `low`, `medium`, `high`, and `xhigh` for `grok`.
+Every candidate requires `id`, `harness`, and `model`; `harness` must be `pi`, `pi-signed`, `grok`, `claude`, or `opencode`, and `model` is an exact whitespace-free model token, which for `opencode` must be an exact `provider/model` id.
+A candidate also requires `effort` for `pi`, `pi-signed`, `grok`, and `claude`, restricted to the effort values that adapter can enforce: `low`, `medium`, `high`, `xhigh`, and `max` for `pi`, `pi-signed`, and `claude`, and `low`, `medium`, and `high` for `grok`.
+An `opencode` candidate must omit `effort`, because no verified launch flag enforces one.
 It is a schema check only; it consults neither a live model catalog nor the launch-time effort mapping, which the [`harness-adapters`](../.agents/skills/harness-adapters/SKILL.md) references and `bin/fm-spawn.sh` own.
 `fast` is optional and boolean for `pi` and `pi-signed`; it is rejected for every other adapter.
 A candidate may carry `"available": false` only with a non-empty `unavailable_reason`, which is the intended representation for a product awaiting approval.

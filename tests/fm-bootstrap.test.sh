@@ -1107,7 +1107,7 @@ test_task_model_preset_bootstrap_validation() {
   rm -f "$fakebin/node"
   ln -s "$(command -v node)" "$fakebin/node"
   cat > "$case_dir/home/config/task-model-presets.json" <<'JSON'
-{"schema_version":1,"seed":"synthetic","presets":{"weighted":{"mode":"weighted","candidates":[{"id":"a","weight":1,"harness":"pi","model":"vendor/model-a","effort":"high"},{"id":"b","weight":1,"harness":"grok","model":"model-b","effort":"xhigh"}]}}}
+{"schema_version":1,"seed":"synthetic","presets":{"weighted":{"mode":"weighted","candidates":[{"id":"a","weight":1,"harness":"pi","model":"vendor/model-a","effort":"high"},{"id":"b","weight":1,"harness":"grok","model":"model-b","effort":"high"}]}}}
 JSON
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")

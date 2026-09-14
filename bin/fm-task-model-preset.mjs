@@ -10,9 +10,8 @@ const ALLOWED_HARNESSES = new Set(["pi", "pi-signed", "grok", "claude", "opencod
 const ALLOWED_EFFORTS = {
   pi: new Set(["low", "medium", "high", "xhigh", "max"]),
   "pi-signed": new Set(["low", "medium", "high", "xhigh", "max"]),
-  grok: new Set(["low", "medium", "high", "xhigh"]),
+  grok: new Set(["low", "medium", "high"]),
   claude: new Set(["low", "medium", "high", "xhigh", "max"]),
-  opencode: new Set(["low", "medium", "high", "xhigh", "max"]),
 };
 const ROOT_KEYS = new Set(["schema_version", "seed", "presets"]);
 const PRESET_KEYS = new Set(["description", "mode", "candidate", "candidates"]);
@@ -52,7 +51,7 @@ function weightUnits(value, where) {
 function validateCandidate(candidate, where, weighted) {
   if (!object(candidate)) fail(`${where} must be an object`);
   exactKeys(candidate, CANDIDATE_KEYS, where);
-  for (const key of ["id", "harness", "model", "effort"]) {
+  for (const key of ["id", "harness", "model"]) {
     if (!nonempty(candidate[key])) fail(`${where} needs non-empty ${key}`);
   }
   if (!/^[A-Za-z0-9._:/+-]+$/.test(candidate.model)) {
@@ -65,12 +64,17 @@ function validateCandidate(candidate, where, weighted) {
     fail(`${where} harness '${candidate.harness}' is not supported by task/model presets`);
   }
   if (candidate.harness === "opencode") {
+    if (Object.hasOwn(candidate, "effort")) {
+      fail(`${where} effort must be omitted for opencode because no verified launch flag enforces one`);
+    }
     if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._:/+-]+$/.test(candidate.model)) {
       fail(`${where} OpenCode model must be an exact provider/model id`);
     }
-  }
-  if (!ALLOWED_EFFORTS[candidate.harness].has(candidate.effort)) {
-    fail(`${where} effort '${candidate.effort}' is unsupported for ${candidate.harness}`);
+  } else {
+    if (!nonempty(candidate.effort)) fail(`${where} needs non-empty effort`);
+    if (!ALLOWED_EFFORTS[candidate.harness].has(candidate.effort)) {
+      fail(`${where} effort '${candidate.effort}' is unsupported for ${candidate.harness}`);
+    }
   }
   if (Object.hasOwn(candidate, "fast")) {
     if (candidate.harness !== "pi" && candidate.harness !== "pi-signed") {
