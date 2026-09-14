@@ -2130,7 +2130,7 @@ test_recovery_retires_preset_provenance_a_failed_close_orphaned() {
   start_item "$case_dir" "$id"
   write_task_meta "$case_dir" "$id" ship local-only "spawn_gen=spawn-preset-orphan"
   write_preset_provenance "$case_dir" "$id"
-  break_verb "$case_dir" done
+  break_verb "$case_dir" "done"
 
   out=$(run_teardown "$case_dir" "$id") || rc=$?
   [ "$rc" -ne 0 ] || fail "a refused backlog close reported success: $out"

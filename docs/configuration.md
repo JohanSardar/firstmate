@@ -507,8 +507,9 @@ Unavailable candidates remain in the draw: if one is sampled, launch stops and r
 Use a new task id for a new experimental draw.
 
 After selection, spawn rechecks the installed tool's live model and setting surface and its usable login where the CLI exposes one.
-Pi requires an exact catalogued `provider/model` with configured provider credentials; explicit fast on or off is restricted to `openai-codex` and rewrites that worker's provider request to `priority` or `default` without changing global fast state.
-The Pi session records the effective model and thinking level, while fast stays `server_verified:false` until response evidence is supplied.
+Pi requires an exact catalogued `provider/model` with configured provider credentials; explicit fast on or off is restricted to `openai-codex`, where the task extension requests `priority` or `default` for that worker without changing global fast state.
+Because Pi runs provider-request handlers in extension load order and a later discovered user or project extension can replace the payload, spawn refuses a fixed fast value when it finds a discovered extension that can register the same hook, or a configured Pi package list, rather than launching with a setting it cannot guarantee.
+The Pi session records the effective model and thinking level, while a requested fast value stays requested-only: the ledger leaves `effective.fast` unclaimed with `fast_basis: requested-not-wire-verified`, and `server_verified` stays false until response evidence is supplied.
 Grok requires `grok models` to report both the exact model and a login; the explicit preset path may pass its currently verified `xhigh` reasoning control while ordinary dispatch retains its older compatible range.
 Claude Code accepts only a current model alias printed by `claude --help`, verifies `claude auth status`, and passes its effort flag.
 OpenCode requires an exact catalogued `provider/model`, verifies the requested effort against that model's verbose variant table and a matching listed credential, then uses `opencode run --interactive --auto --variant` for the preset worker; ordinary OpenCode launches retain their prior command.

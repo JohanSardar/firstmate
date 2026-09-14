@@ -162,18 +162,24 @@ function collectRuntime(choicePath, fields) {
 }
 function launchSettings(record, fields) {
   const requested = record.selected;
+  const requestedFast = Object.hasOwn(requested, "fast") ? requested.fast : null;
   return {
     requested: {
       harness: requested.harness,
       model: requested.model,
       effort: requested.effort,
-      fast: Object.hasOwn(requested, "fast") ? requested.fast : null,
+      fast: requestedFast,
     },
     effective: {
       harness: fields.harness,
       model: fields.model === "default" ? null : fields.model,
       effort: fields.effort === "default" ? null : fields.effort,
-      fast: fields.dispatch_fast === "on" ? true : fields.dispatch_fast === "off" ? false : null,
+      // Pi runs provider-request handlers in extension load order and a later
+      // discovered extension can replace the payload, so a requested fast
+      // value is never claimed as the effective wire value; server_verified
+      // stays false until response evidence exists.
+      fast: null,
+      fast_basis: requestedFast === null ? null : "requested-not-wire-verified",
       basis: "validated-launch-control",
       server_verified: false,
       tool_version: fields.dispatch_tool_version || null,

@@ -1534,8 +1534,60 @@ pi_supports_tui_mode() {
   printf '%s\n' "$help" | grep -Eq -- '(^|[[:space:]])--tui-mode([[:space:]=]|$)'
 }
 
+# Print a discovered Pi extension that can register its own provider-request
+# hook, or nothing when none is found. Pi runs before_provider_request handlers
+# in extension load order, and the task extension is an explicit -e path that
+# loads before discovered user and project extensions, so any later handler can
+# replace the payload and override a per-worker service_tier request. Discovered
+# extension files and explicit settings.json extension paths are inspected; a
+# configured Pi package is treated as a possible conflict because its hook
+# registrations cannot be read reliably. This is a conflict detector, never a
+# proof that no rewriter exists, which is why the comparison ledger never
+# records a requested fast value as effective.
+pi_provider_request_rewriter_in_path() {  # <file-or-dir>
+  local path=$1 candidate
+  if [ -f "$path" ]; then
+    grep -qF 'before_provider_request' "$path" 2>/dev/null && printf '%s\n' "$path"
+    return 0
+  fi
+  [ -d "$path" ] || return 0
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    if grep -qF 'before_provider_request' "$candidate" 2>/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(find "$path" -maxdepth 2 -type f \( -name '*.ts' -o -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) 2>/dev/null | LC_ALL=C sort)
+  return 0
+}
+
+pi_provider_request_rewriter() {  # <project-dir>
+  local project=$1 agent_dir settings path candidate
+  agent_dir=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
+  for path in "$agent_dir/extensions" "$project/.pi/extensions"; do
+    candidate=$(pi_provider_request_rewriter_in_path "$path") || true
+    [ -n "$candidate" ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  settings="$agent_dir/settings.json"
+  [ -f "$settings" ] || return 1
+  if jq -e '((.packages // []) | length > 0)' "$settings" >/dev/null 2>&1; then
+    printf '%s\n' "$settings (configured package list)"
+    return 0
+  fi
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    candidate=$(pi_provider_request_rewriter_in_path "$path") || true
+    [ -n "$candidate" ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done < <(jq -r '(.extensions // [])[] | select(type == "string")' "$settings" 2>/dev/null)
+  return 1
+}
+
 dispatch_validate_live_settings() {
-  local listing row provider model_id details auth help_text provider_label
+  local listing row provider model_id details auth help_text provider_label conflict
   [ -n "$DISPATCH_PRESET" ] || return 0
   if [ -n "$DISPATCH_FAST" ] && [ "$HARNESS" != pi ] && [ "$HARNESS" != pi-signed ]; then
     echo "error: preset '$DISPATCH_PRESET' has a Pi fast setting that cannot be carried by relaunch harness '$HARNESS'" >&2
@@ -1563,6 +1615,10 @@ dispatch_validate_live_settings() {
       }
       if [ -n "$DISPATCH_FAST" ] && [ "$provider" != openai-codex ]; then
         echo "error: preset '$DISPATCH_PRESET' selected fast=$DISPATCH_FAST for '$MODEL'; per-worker fast control is verified only for openai-codex models" >&2
+        return 1
+      fi
+      if [ -n "$DISPATCH_FAST" ] && conflict=$(pi_provider_request_rewriter "$PROJ"); then
+        echo "error: preset '$DISPATCH_PRESET' sets fast=$DISPATCH_FAST, but discovered extension '$conflict' can rewrite the provider request after the per-worker extension; the requested fast value cannot be guaranteed (remove the fast setting from this candidate or stop loading that extension)" >&2
         return 1
       fi
       if [ ! -f "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/auth.json" ] \
@@ -3737,9 +3793,12 @@ export default function (pi: any) {
   pi.on("session_start", (_event: any, ctx: any) => {
     persistRuntime(ctx);
     if (fastRequested !== null) {
-      // Explicit extensions load before user-global extensions. Registering this
-      // rewrite at session start puts it after handlers registered at factory
-      // load, so the per-worker choice wins over an older global fast default.
+      // Pi runs before_provider_request handlers in extension load order, and
+      // this explicit -e extension loads before discovered user/project
+      // extensions, so a later handler can replace the payload and override
+      // this request. Fast is therefore recorded as requested only, never as a
+      // verified effective value, and fm-spawn refuses a fixed fast preset
+      // while a discovered extension can register the same hook.
       pi.on("before_provider_request", (event: any, requestCtx: any) => {
         const model = requestCtx?.model;
         if (model?.provider !== "openai-codex" || model?.api !== "openai-codex-responses") return;

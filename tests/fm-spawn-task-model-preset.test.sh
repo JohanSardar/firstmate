@@ -144,8 +144,69 @@ JS
 node --no-warnings "$DIR/assert-pi-fast.mjs" "$HOME_DIR/state/pi-preset-task.pi-ext.ts" \
   || fail "generated Pi extension did not apply fast off at runtime"
 [ ! -e "$HOME_DIR/user-home/.pi/agent/settings.json" ] || fail "Pi preset changed global settings"
-[ "$(grep '^dispatch_fast=' "$HOME_DIR/state/pi-preset-task.meta")" = dispatch_fast=off ] || fail "Pi fast effective setting was not recorded"
+[ "$(grep '^dispatch_fast=' "$HOME_DIR/state/pi-preset-task.meta")" = dispatch_fast=off ] || fail "Pi requested fast setting was not recorded"
 [ "$(jq -s -r '.[0].selection.selected_candidate' "$HOME_DIR/data/dispatch-metrics.jsonl")" = candidate ] || fail "Pi launch provenance was not recorded"
+# A requested fast value is never claimed as the effective wire value, because
+# a later discovered extension can replace the provider payload.
+[ "$(jq -s -r '.[0].effective.fast' "$HOME_DIR/data/dispatch-metrics.jsonl")" = null ] || fail "requested Pi fast was claimed as effective"
+[ "$(jq -s -r '.[0].effective.fast_basis' "$HOME_DIR/data/dispatch-metrics.jsonl")" = requested-not-wire-verified ] || fail "Pi fast basis was not recorded as requested-only"
+
+# A discovered user extension that can register its own provider-request hook
+# makes a fixed fast value unguaranteeable, so the preset refuses before launch.
+record=$(make_case pi-conflict pi-conflict-task pi openai-codex/model-pi max false)
+IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
+$record
+EOF
+install_fake_pi "$FAKEBIN_DIR"
+mkdir -p "$HOME_DIR/user-home/.pi/agent/extensions"
+cat > "$HOME_DIR/user-home/.pi/agent/extensions/global-fast.ts" <<'TS'
+export default function (pi) {
+  pi.on("before_provider_request", (event) => ({ ...event.payload, service_tier: "priority" }));
+}
+TS
+set +e
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-conflict-task "$PROJ_DIR" "$DIR/launch.log")
+status=$?
+set -e
+[ "$status" -ne 0 ] || fail "a fixed fast preset launched while a discovered extension could rewrite the request"
+assert_contains "$out" "cannot be guaranteed" "fast conflict refusal wording"
+assert_contains "$out" "global-fast.ts" "fast conflict refusal names the conflicting extension"
+[ ! -s "$DIR/launch.log" ] || fail "fast conflict refusal still delivered a launch"
+
+# An explicit settings.json extension path that registers the same hook conflicts
+# the same way, because it loads after the task extension too.
+rm -f "$HOME_DIR/user-home/.pi/agent/extensions/global-fast.ts"
+cat > "$HOME_DIR/user-home/.pi/agent/settings-conflict.ts" <<'TS'
+export default function (pi) {
+  pi.on("before_provider_request", () => undefined);
+}
+TS
+printf '{"extensions":["%s"]}\n' "$HOME_DIR/user-home/.pi/agent/settings-conflict.ts" \
+  > "$HOME_DIR/user-home/.pi/agent/settings.json"
+set +e
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-conflict-task "$PROJ_DIR" "$DIR/launch2.log")
+status=$?
+set -e
+[ "$status" -ne 0 ] || fail "a fixed fast preset launched while a configured extension could rewrite the request"
+assert_contains "$out" "settings-conflict.ts" "fast conflict refusal names the configured extension"
+[ ! -s "$DIR/launch2.log" ] || fail "configured-extension refusal still delivered a launch"
+
+# A discovered extension without the request hook does not conflict, so the
+# refusal is targeted at possible payload rewriters rather than any extension.
+record=$(make_case pi-harmless pi-harmless-task pi openai-codex/model-pi max false)
+IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
+$record
+EOF
+install_fake_pi "$FAKEBIN_DIR"
+mkdir -p "$HOME_DIR/user-home/.pi/agent/extensions"
+cat > "$HOME_DIR/user-home/.pi/agent/extensions/turn-end.ts" <<'TS'
+export default function (pi) {
+  pi.on("turn_end", () => {});
+}
+TS
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-harmless-task "$PROJ_DIR" "$DIR/launch.log") \
+  || fail "a harmless discovered extension blocked a fixed fast preset: $out"
+assert_contains "$(cat "$DIR/launch.log")" "--model 'openai-codex/model-pi' --thinking 'max'" "harmless-extension Pi launch settings"
 
 record=$(make_case grok grok-preset-task grok grok-example xhigh)
 IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF

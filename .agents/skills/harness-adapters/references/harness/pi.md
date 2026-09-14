@@ -14,7 +14,7 @@ Verified on 2026-07-27 with Pi and Pi-signed 0.82.0 unless a fact gives another 
 | Model flag | `--model <model>`. |
 | Effort flag | `--thinking <low\|medium\|high\|xhigh\|max>`; both identities expose the same levels and completed the same model-qualified max-thinking smoke. |
 | Model discovery | Run the selected executable as `<executable> --list-models [search]`; Pi's installed `docs/models.md` owns how built-in, extension-registered, and custom provider/model entries reach that list. |
-| Preset fast | Optional boolean for exact `openai-codex` models only; the task extension sets provider `service_tier` to `priority` or `default` per worker and records server verification as false until response evidence exists. |
+| Preset fast | Optional boolean for exact `openai-codex` models only; the task extension requests provider `service_tier` `priority` or `default` for that worker and records server verification as false until response evidence exists. |
 
 Native Codex sessions may request `ultra` through the native extension flag described by `../../../bin/fm-spawn.sh`; it is separate from Pi's thinking levels.
 Pi has no permission system, so workers are always autonomous.
@@ -41,7 +41,8 @@ The decision persists per path in `~/.pi/agent/trust.json`, so later spawns in t
 The extension listens for Pi's `turn_end` event, not `agent_end`, so supervision is notified after each completed turn rather than only when the whole run exits.
 Native-harness progress uses the separate generation-bound marker owned by `../../../bin/fm-busy-event.sh`; it never fabricates Pi turn completion.
 For an opt-in preset, the same extension records Pi's active provider/model, effective thinking level, session identity, and explicit fast request.
-Its fast request rewrite is registered at session start so it follows factory-registered global request handlers without changing global configuration; only the selected worker is affected.
+Pi invokes `before_provider_request` handlers in extension load order, and this explicit `-e` extension loads before discovered user and project extensions, so a later extension that registers that hook can replace the payload and override the request; a requested fast value is therefore recorded as requested-only and never claimed as effective, and `bin/fm-spawn.sh` refuses a fixed `fast` value when it finds a discovered extension that can register the same hook.
+Nothing in the request path changes global configuration; only the selected worker is affected.
 `before_provider_request` reaches a handler as `{type, payload}` with the selected model on the handler context argument, not on the event (verified 0.85.1), so the rewrite reads `ctx.model` and returns the amended `event.payload`.
 Pi sets `PI_CODING_AGENT=true` for its children as its harness-detection marker.
 
