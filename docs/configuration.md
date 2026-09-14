@@ -11,7 +11,7 @@ The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - edit it 
 This section is the single owner of the top-level operational-home layout; producer script headers and their help own exact child-file fields and mutation contracts.
 The tracked code root contains the shared instruction, skill, documentation, workflow, and `bin/` surfaces, while each effective `FM_HOME` contains private operational directories.
 `data/` holds durable private fleet records such as the project and secondmate registries, captain preferences, optional shared captain preferences, learnings, backlog, briefs, scout reports, and explicitly installed content-addressed extension packages under `data/extensions/packages/`.
-`state/` holds runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, inactive terminal-outcome receipts under `state/terminal-outcomes/`, enabled extension working namespaces under `state/extensions/`, away-mode state, generated Relay artifacts, parent-side remote ledger copies under `state/secondmate-summary-cache/`, one-shot Bearings reconcile requests under `state/reconcile-notify/`, private secondmate config-reread generations with their retry and quarantine state, per-task steering-inbox records under `state/<id>.inbox/` (`bin/fm-task-inbox-lib.sh`), and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
+`state/` holds runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, inactive terminal-outcome receipts under `state/terminal-outcomes/`, enabled extension working namespaces under `state/extensions/`, away-mode state, generated Relay artifacts, parent-side remote ledger copies under `state/secondmate-summary-cache/`, one-shot Bearings reconcile requests under `state/reconcile-notify/`, private secondmate config-reread generations with their retry and quarantine state, per-task steering-inbox records under `state/<id>.inbox/` (`bin/fm-task-inbox-lib.sh`), durable opt-in preset selections in `state/<id>.dispatch-choice.json` (`bin/fm-task-model-preset.sh`), and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
 `config/` holds local gitignored operating choices, including explicit extension bindings under `config/extensions.d/`, and `projects/` holds the local project clones that Firstmate reads but changes only through the narrow guarded and concrete captain-approved exceptions in `AGENTS.md`.
 Untracked files and directories whose names begin with `scratchpad` are also gitignored, so temporary scratch does not make porcelain-based secondmate sync guards treat a home as dirty.
 
@@ -454,8 +454,9 @@ Secondmate homes inherit this file from the primary, so a secondmate's own crewm
 ## Task/model presets (config/task-model-presets.json)
 
 `config/task-model-presets.json` is a separate, optional, gitignored experiment surface for explicit task categories with fixed or weighted launch choices.
-This delivery provides only its schema validation and deterministic selection: `fm-spawn.sh --preset <name>` activation, live adapter checks, and the comparison metrics ledger are explicitly forward-looking and owned by the separate executable-adapter and metrics delivery.
-Until that delivery lands the file stays inert, so no spawn reads it and no preset is activated implicitly.
+This section is the single owner of its schema and selection contract; `bin/fm-task-model-preset.sh` is its only reader, and that script's header owns the exact commands.
+No spawn path reads the file: `fm-spawn.sh` has no preset flag, session-start bootstrap only validates it, and a preset applies only when firstmate explicitly runs the selector for a named task, so no preset is ever activated implicitly.
+A selected preset is not yet executable or measured: launch wiring, live adapter checks, and the comparison metrics ledger are outside this contract.
 Its absence leaves static harness resolution, natural-language crew dispatch, quota-ranked arrays, running workers, and secondmate behavior unchanged.
 The file is deliberately not inherited into secondmate homes: each home opts into its own experiment and keeps its own project memory, credentials, and measurements.
 No task category, candidate, model, product, seed, or weight ships enabled by default.
@@ -481,7 +482,7 @@ The canonical schema is:
     "example-weighted": {
       "mode": "weighted",
       "candidates": [
-        { "id": "choice-a", "weight": 1, "harness": "grok", "model": "model-a", "effort": "xhigh" },
+        { "id": "choice-a", "weight": 1, "harness": "grok", "model": "model-a", "effort": "high" },
         { "id": "choice-b", "weight": 1, "harness": "claude", "model": "opus", "effort": "medium" }
       ]
     }
@@ -490,22 +491,27 @@ The canonical schema is:
 ```
 
 `schema_version` must be `1` and `presets` must be a non-empty object.
-Every preset is named explicitly; there is no implicit or alias default.
-Preset and candidate identifiers use letters, numbers, dot, underscore, and dash.
-Every candidate requires `id`, `harness`, `model`, and `effort`; presets currently support `pi`, `pi-signed`, `grok`, `claude`, and `opencode` because those are the adapters with verified exact controls.
-OpenCode effort is restricted to the shared `low`, `medium`, `high`, `xhigh`, and `max` vocabulary so the recorded setting remains safe for the existing relaunch path, then its live model catalog must advertise that exact variant.
-Pi `fast` is optional and boolean; it is rejected for every other adapter.
+Every preset is named explicitly; there is no implicit or alias default, and a root `default` key is rejected as an unknown field.
+Preset and candidate identifiers start with a letter or number and use only letters, numbers, dot, underscore, and dash.
+Every candidate requires `id`, `harness`, `model`, and `effort`; `harness` must be `pi`, `pi-signed`, `grok`, `claude`, or `opencode`, and `model` is an exact whitespace-free model token, which for `opencode` must be an exact `provider/model` id.
+The validator accepts only the shared effort vocabulary that the launch and relaunch paths already accept: `low`, `medium`, `high`, `xhigh`, and `max` for `pi`, `pi-signed`, `claude`, and `opencode`, and `low`, `medium`, `high`, and `xhigh` for `grok`.
+It is a schema check only; it consults neither a live model catalog nor the launch-time effort mapping, which the [`harness-adapters`](../.agents/skills/harness-adapters/SKILL.md) references and `bin/fm-spawn.sh` own.
+`fast` is optional and boolean for `pi` and `pi-signed`; it is rejected for every other adapter.
 A candidate may carry `"available": false` only with a non-empty `unavailable_reason`, which is the intended representation for a product awaiting approval.
 Firstmate never substitutes a similarly named free, contributor, API-billed, or differently authenticated product.
 
 A fixed preset has exactly one `candidate` and no weights.
-A weighted preset has at least two uniquely identified `candidates`, each with a positive numeric `weight` of at most six decimal places, and requires a non-empty top-level `seed`.
+A weighted preset has at least two uniquely identified `candidates`, each with a positive numeric `weight` of at most six decimal places and at most 1000000, and requires a non-empty top-level `seed`.
 Selection hashes seed + preset + task id with SHA-256 and maps the first 52 bits into the unmodified sum of configured weights.
-The selected result, candidate table, algorithm, bucket, sample hash, and config hash are written to `state/<id>.dispatch-choice.json` before any later live adapter validation.
+The selected result, candidate table, algorithm, bucket, sample hash, and config hash are written to `state/<id>.dispatch-choice.json` before the selector reports the choice.
 Retries reuse that exact sampled record even if the config changed.
 When the current preset still contains the same candidate id, harness, and model, its current availability is rechecked without changing the recorded sample, so a later `available:false` stops the retry and a later approval can enable the already-selected product.
 Unavailable candidates remain in the draw: if one is sampled, selection stops and retains the sample instead of renormalizing the other weights or counting a fallback as the sample.
 Use a new task id for a new experimental draw.
+
+When the file exists, bootstrap validates it through `bin/fm-task-model-preset.sh validate`.
+Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstrap emits `BOOTSTRAP_INFO: task/model presets active config/task-model-presets.json`.
+A malformed file is reported as `TASK_MODEL_PRESETS: invalid config/task-model-presets.json - <reason>`, and ordinary dispatch stays available because nothing reads the file implicitly; a missing `node` is reported once through the normal `MISSING: node` flow while the preset check stays silent.
 
 ## Toolchain
 
