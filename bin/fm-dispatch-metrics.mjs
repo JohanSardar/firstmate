@@ -898,6 +898,12 @@ function collectRuntime(choicePath, fields, recordedSessions) {
 // attributed from evidence stays unknown rather than defaulting to the worker
 // that happened to be running.
 const DEFECT_ORIGINS = new Set(["original-implementation-worker", "validation-correction", "pre-existing-code", "unknown"]);
+// Only a quality observation that records an actual defect is attribution
+// evidence. A passed result or a generic unknown quality says nothing about a
+// defect, so it can neither add evidence nor force an unknown-origin verdict;
+// a defect that cannot be attributed stays unknown on its own defect record,
+// never defaulted to the worker that happened to be running.
+const DEFECT_QUALITY_STATUSES = new Set(["bug-found", "bug-escaped"]);
 // The finish event's defect attribution. Only an explicit origin recorded by an
 // observation event counts as evidence: a bare quality status never implies
 // who caused a defect, and disagreeing recorded origins stay unknown rather
@@ -914,6 +920,7 @@ function defectAttribution(ledger, taskID) {
         fail(`dispatch metrics ledger ${ledger} contains malformed JSON`);
       }
       if (event.event !== "observation" || event.task_id !== taskID || !object(event.quality)) continue;
+      if (!DEFECT_QUALITY_STATUSES.has(event.quality.status)) continue;
       const origin = event.quality.defect_origin;
       if (typeof origin !== "string" || !DEFECT_ORIGINS.has(origin)) continue;
       evidence.push({

@@ -214,6 +214,58 @@ FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" finish "$metrics_dir/state/metri
 [ "$(jq -s -r 'map(select(.event=="finish"))[2].quality.defect_attribution.origin' "$ledger")" = unknown ] || fail "an explicitly unattributed defect was hidden behind another origin"
 [ "$(jq -s -r 'map(select(.event=="finish"))[2].quality.defect_attribution.basis' "$ledger")" = "at least one recorded defect was explicitly left without a proven origin" ] || fail "the mixed-attribution reason was not recorded"
 
+# A quality observation that records no defect is never attribution evidence:
+# a passed result or a generic unknown quality must neither add defect evidence
+# nor force an unknown-defect verdict, while an actual defect record keeps its
+# own explicit origin. These records are hand-written observations representing
+# integration producers the way the typed ledger accepts them.
+defect_scope_dir="$TMP_ROOT/defect-scope"
+mkdir -p "$defect_scope_dir/data" "$defect_scope_dir/state"
+printf '%s\n' '{"schema_version":1,"presets":{"fixed":{"mode":"fixed","candidate":{"id":"candidate","harness":"pi","model":"openai-codex/model","effort":"high"}}}}' > "$defect_scope_dir/config.json"
+write_defect_scope_meta() {  # <task> <spawn-gen>
+  cat > "$defect_scope_dir/state/$1.meta" <<META
+harness=pi
+kind=ship
+model=openai-codex/model
+effort=high
+spawn_gen=$2
+dispatch_preset=fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_generation=defect-scope-generation
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
+META
+}
+defect_choice=$(FM_STATE_OVERRIDE="$defect_scope_dir/state" "$PRESET" select mixed-defect-task fixed "$defect_scope_dir/config.json") || fail "mixed defect-scope choice failed"
+printf '%s\n' "$defect_choice" > "$defect_scope_dir/state/mixed-defect-task.dispatch-choice.json"
+write_defect_scope_meta mixed-defect-task s1
+scope_ledger="$defect_scope_dir/data/dispatch-metrics.jsonl"
+printf '%s\n' \
+  '{"event":"observation","event_id":"obs-passed","task_id":"mixed-defect-task","quality":{"status":"passed","basis":"tests passed","defect_origin":"unknown","defect_origin_explicit":false,"defect_origin_basis":"no defect origin evidence was supplied with this observation"}}' \
+  '{"event":"observation","event_id":"obs-unknown","task_id":"mixed-defect-task","quality":{"status":"unknown","basis":"quality not assessed","defect_origin":"unknown","defect_origin_explicit":true,"defect_origin_basis":"operator left the call open"}}' \
+  '{"event":"observation","event_id":"obs-bug","task_id":"mixed-defect-task","quality":{"status":"bug-found","basis":"reproduced defect","defect_origin":"validation-correction","defect_origin_explicit":true,"defect_origin_basis":"the validation fix introduced it"}}' \
+  >> "$scope_ledger"
+FM_DATA_OVERRIDE="$defect_scope_dir/data" "$METRICS" finish "$defect_scope_dir/state/mixed-defect-task.meta" "$defect_scope_dir/state/mixed-defect-task.dispatch-choice.json" landed || fail "mixed defect-scope finish failed"
+mixed_scope=$(jq -c -s 'map(select(.event=="finish" and .task_id=="mixed-defect-task"))[0].quality.defect_attribution | {origin, evidence: [.evidence[].event_id], basis}' "$scope_ledger")
+[ "$mixed_scope" = '{"origin":"validation-correction","evidence":["obs-bug"],"basis":"recorded by explicit defect-origin observation(s) obs-bug"}' ] \
+  || fail "non-defect observations polluted defect attribution: $mixed_scope"
+
+# With no defect observation at all, passed and unknown records create no
+# attribution result: the finish event stays conservatively unattributed with
+# empty evidence instead of claiming a defect whose origin was unknown.
+passed_choice=$(FM_STATE_OVERRIDE="$defect_scope_dir/state" "$PRESET" select passed-only-task fixed "$defect_scope_dir/config.json") || fail "passed-only defect-scope choice failed"
+printf '%s\n' "$passed_choice" > "$defect_scope_dir/state/passed-only-task.dispatch-choice.json"
+write_defect_scope_meta passed-only-task s2
+printf '%s\n' \
+  '{"event":"observation","event_id":"obs-passed-only","task_id":"passed-only-task","quality":{"status":"passed","basis":"tests passed","defect_origin":"unknown","defect_origin_explicit":false,"defect_origin_basis":"no defect origin evidence was supplied with this observation"}}' \
+  '{"event":"observation","event_id":"obs-unknown-only","task_id":"passed-only-task","quality":{"status":"unknown","basis":"quality not assessed","defect_origin":"unknown","defect_origin_explicit":true,"defect_origin_basis":"operator left the call open"}}' \
+  >> "$scope_ledger"
+FM_DATA_OVERRIDE="$defect_scope_dir/data" "$METRICS" finish "$defect_scope_dir/state/passed-only-task.meta" "$defect_scope_dir/state/passed-only-task.dispatch-choice.json" landed || fail "passed-only defect-scope finish failed"
+passed_scope=$(jq -c -s 'map(select(.event=="finish" and .task_id=="passed-only-task"))[0].quality.defect_attribution | {origin, evidence: (.evidence | length), basis}' "$scope_ledger")
+[ "$passed_scope" = '{"origin":"unknown","evidence":0,"basis":"no defect origin was observed for this task"}' ] \
+  || fail "non-defect observations created an unknown-defect attribution: $passed_scope"
+
 claude_dir="$TMP_ROOT/claude"
 mkdir -p "$claude_dir/data" "$claude_dir/state" "$claude_dir/config/projects/worktree"
 printf '%s\n' '{"schema_version":1,"presets":{"claude-fixed":{"mode":"fixed","candidate":{"id":"opus","harness":"claude","model":"opus","effort":"medium"}}}}' > "$claude_dir/config.json"

@@ -503,6 +503,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-herdr-pi-registration-lib.sh"
 # shellcheck source=bin/fm-grok-effort-lib.sh
 . "$SCRIPT_DIR/fm-grok-effort-lib.sh"
+# shellcheck source=bin/fm-claude-model-lib.sh
+. "$SCRIPT_DIR/fm-claude-model-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -1630,7 +1632,7 @@ pi_supports_tui_mode() {
 }
 
 dispatch_validate_live_settings() {
-  local listing row provider model_id details auth help_text provider_label pi_agent_dir pi_package_dir pi_probe pi_plan_reason grok_catalog grok_effort_reason
+  local listing row provider model_id details auth help_text provider_label pi_agent_dir pi_package_dir pi_probe pi_plan_reason grok_catalog grok_effort_reason claude_model_reason
   local model_requested=0 effort_requested=0
   [ -n "$DISPATCH_PRESET" ] || return 0
   # 'default' is not a requested setting: it means this axis was deliberately
@@ -1761,11 +1763,16 @@ dispatch_validate_live_settings() {
         echo "error: preset '$DISPATCH_PRESET' could not read Claude Code's launch controls" >&2
         return 1
       }
+      # The help text is the installed CLI's own token-free documentation, and
+      # it is the only authoritative evidence available: no installed Claude
+      # catalog enumerates exact ids. A requested model is proven only when the
+      # help quotes that exact token; anything else refuses before launch rather
+      # than accepting a plausible pattern or probing the CLI with a prompt.
       if [ "$model_requested" -eq 1 ]; then
-        printf '%s\n' "$help_text" | grep -Fq "'$MODEL'" || {
-          echo "error: preset '$DISPATCH_PRESET' selected Claude model '$MODEL', which is not a current alias documented by 'claude --help'" >&2
+        if ! claude_model_reason=$(fm_claude_model_evidence "$help_text" "$MODEL"); then
+          echo "error: preset '$DISPATCH_PRESET' selected Claude model '$MODEL', but the installed CLI's token-free evidence cannot prove it: $claude_model_reason" >&2
           return 1
-        }
+        fi
       fi
       claude auth status --json 2>/dev/null | jq -e '.loggedIn == true' >/dev/null || {
         echo "error: preset '$DISPATCH_PRESET' selected Claude Code, but 'claude auth status' does not report a usable login" >&2

@@ -134,7 +134,7 @@ install_fake_claude() {
   cat > "$fakebin/claude" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = --help ]; then
-  printf '%s\n' "--model <model> aliases: 'fable', 'opus', or 'sonnet'" '--effort <level> low medium high xhigh max'
+  printf '%s\n' "--model <model> Model for the current session. Provide an alias for the latest model (e.g. 'fable', 'opus', or 'sonnet') or a model's full name (e.g. 'claude-fable-5')." '--effort <level> low medium high xhigh max'
 elif [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
   printf '%s\n' '{"loggedIn":true}'
 elif [ "${1:-}" = --version ]; then
@@ -381,6 +381,33 @@ out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" claude-preset-task "$PROJ_DI
 launch=$(cat "$DIR/launch.log")
 assert_contains "$launch" "--session-id '" "Claude session identity"
 assert_contains "$launch" "--model 'opus' --effort 'medium'" "Claude launch settings"
+
+# The help documents the full-name form with a quoted example, so a documented
+# full name is proven by the installed token-free surface and launches exactly
+# as requested.
+record=$(make_case claude-full-name claude-full-name-task claude claude-fable-5 medium)
+IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
+$record
+EOF
+install_fake_claude "$FAKEBIN_DIR"
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" claude-full-name-task "$PROJ_DIR" "$DIR/launch.log") || fail "Claude documented full-name preset spawn failed: $out"
+launch=$(cat "$DIR/launch.log")
+assert_contains "$launch" "--model 'claude-fable-5' --effort 'medium'" "Claude full-name launch settings"
+
+# An exact id the installed help does not quote has no token-free proof:
+# Claude Code ships no authoritative catalog that enumerates exact ids, and a
+# plausible-looking name is never accepted by pattern or probed with a prompt,
+# so the launch refuses and names the evidence gap.
+record=$(make_case claude-unproven claude-unproven-task claude claude-opus-5 medium)
+IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
+$record
+EOF
+install_fake_claude "$FAKEBIN_DIR"
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" claude-unproven-task "$PROJ_DIR" "$DIR/launch.log") \
+  && fail "a Claude preset launched an exact id no token-free evidence documents"
+assert_contains "$out" "cannot prove it" "Claude unproven-model refusal"
+assert_contains "$out" "does not document model 'claude-opus-5'" "Claude unproven-model evidence gap"
+[ ! -s "$DIR/launch.log" ] || fail "the Claude unproven-model refusal still delivered a launch"
 
 record=$(make_case opencode opencode-preset-task opencode vendor/model-open xhigh)
 IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
