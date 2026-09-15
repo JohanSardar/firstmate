@@ -85,15 +85,15 @@ function findNamed(root, name, depth = 3) {
   }
   return found;
 }
-// Every runtime session a preset launch recorded for this task, oldest first.
-// A relaunch re-mints the session id (Claude and Grok refuse a reused id), so
-// the finish event must aggregate every incarnation the ledger recorded rather
-// than counting only the last one. Sessionless incarnations are kept too: a
-// Pi or OpenCode launch records no runtime session, and dropping those entries
-// would let a tool switch hide prior usage instead of reporting it unknown.
-function readRecordedSessions(ledger, taskID) {
+// Every launch-prepared record for this task in its current generation, oldest
+// first. The generation is the task's own launch origin (dispatch_started_at),
+// which every relaunch preserves and a fresh spawn re-mints, so reusing a task
+// id after teardown cannot absorb a previous task's incarnations from the
+// append-only ledger. A record with an origin and one without cannot be proven
+// to belong to the same lifetime, so they never mix.
+function readRecordedLaunches(ledger, taskID, generation) {
   if (!existsSync(ledger)) return [];
-  const sessions = [];
+  const launches = [];
   for (const line of readFileSync(ledger, "utf8").split("\n")) {
     if (!line) continue;
     let event;
@@ -103,12 +103,47 @@ function readRecordedSessions(ledger, taskID) {
       fail(`dispatch metrics ledger ${ledger} contains malformed JSON`);
     }
     if (event.event !== "launch-prepared" || event.task_id !== taskID) continue;
+    const eventGeneration = typeof event.generation === "string" && event.generation
+      ? event.generation
+      : typeof event.started_at === "string" && event.started_at ? event.started_at : null;
+    if (eventGeneration !== generation) continue;
+    launches.push(event);
+  }
+  return launches;
+}
+// Every runtime session those launches recorded, oldest first, deduplicated by
+// harness+session. A relaunch re-mints the session id (Claude and Grok refuse a
+// reused id), so the finish event aggregates every incarnation the ledger
+// recorded rather than counting only the last one. Sessionless incarnations are
+// kept too: a Pi or OpenCode launch records no runtime session, and dropping
+// them would let a tool switch hide prior usage instead of reporting it unknown.
+function recordedSessions(launches) {
+  const sessions = [];
+  for (const event of launches) {
     const harness = event.effective?.harness ?? null;
     const session = typeof event.runtime_session === "string" && event.runtime_session ? event.runtime_session : null;
     if (sessions.some((entry) => entry.session === session && entry.harness === harness)) continue;
     sessions.push({ session, harness });
   }
   return sessions;
+}
+// Explicit launch totals for the finish event, derived from the same ledger
+// records. A launch is one delivered incarnation; a relaunch is a launch that
+// replaced a running agent; a retry is a fresh spawn that reused an
+// already-sampled durable choice instead of making a new draw. Legacy records
+// without a recorded kind fall back to position (the first is the spawn), never
+// to a session or subagent count.
+function launchTotals(launches) {
+  let relaunches = 0;
+  let retries = 0;
+  launches.forEach((event, index) => {
+    const kind = event.launch_kind === "relaunch" || event.launch_kind === "spawn"
+      ? event.launch_kind
+      : index === 0 ? "spawn" : "relaunch";
+    if (kind === "relaunch") relaunches += 1;
+    else if (event.selection_reused === true) retries += 1;
+  });
+  return { launches: launches.length, relaunches, retries };
 }
 // One Claude transcript's usage, including the Agent-tool subagent transcripts
 // that live beside the main session file. Every assistant message is counted
@@ -702,6 +737,35 @@ function usageHarnessFamily(harness) {
   // switch between those identities is not a cross-harness move for usage.
   return harness === "pi-signed" ? "pi" : harness;
 }
+// The live extension/plugin snapshot and the local-store collector observe the
+// same incarnation from different angles, so neither may silently erase the
+// other's limits. The collector owns completeness, usage, and the effort it
+// measured from the session store; the live record keeps the values only it can
+// know (fast request state, observation time) and fills a field the collector
+// could not bind. A model or effort disagreement is recorded rather than
+// hidden, while the collector's measured value stays the reported one.
+function mergeRuntimeObservation(runtime, collected) {
+  const merged = {
+    ...runtime,
+    ...collected,
+    usage_basis: collected.basis ?? runtime.usage_basis ?? null,
+    fast_requested: runtime.fast_requested ?? null,
+    fast_server_verified: runtime.fast_server_verified ?? false,
+  };
+  merged.session_id = collected.session_id ?? runtime.session_id ?? null;
+  if (merged.usage === undefined) merged.usage = runtime.usage;
+  const conflicts = [];
+  for (const field of ["model_used", "effort_used"]) {
+    const live = runtime[field] ?? null;
+    const observed = collected[field] ?? null;
+    if (live && observed && live !== observed) conflicts.push({ field, live, observed });
+    // The collector's measured value is authoritative when it has one; the
+    // live snapshot fills only what the collector could not bind.
+    merged[field] = observed ?? live;
+  }
+  if (conflicts.length > 0) merged.conflicts = conflicts;
+  return merged;
+}
 function collectRuntime(choicePath, fields, recordedSessions) {
   const runtimePath = choicePath.replace(/\.dispatch-choice\.json$/, ".dispatch-runtime.json");
   const runtime = existsSync(runtimePath) ? readJson(runtimePath, "dispatch runtime observation") : null;
@@ -757,12 +821,7 @@ function collectRuntime(choicePath, fields, recordedSessions) {
   }
   if (runtime) {
     if (!collected) return runtime;
-    return {
-      ...runtime,
-      usage_basis: collected.basis ?? runtime.usage_basis ?? null,
-      sessions: collected.sessions ?? runtime.sessions ?? [],
-      usage: collected.usage ?? runtime.usage,
-    };
+    return mergeRuntimeObservation(runtime, collected);
   }
   return collected;
 }
@@ -824,13 +883,27 @@ if (command === "launch" || command === "finish") {
       },
       ...settings,
       started_at: fields.dispatch_started_at || null,
+      // The generation token scopes this launch to one task lifetime; a
+      // relaunch preserves it and a fresh spawn mints a new one, so a reused
+      // task id cannot absorb a previous task's incarnations. Records written
+      // before the token existed carry only the launch origin.
+      generation: fields.dispatch_generation || null,
+      // The launch kind and whether this launch reused an already-sampled
+      // durable choice are recorded so the finish event can total launches,
+      // relaunches, and retries without inferring them from session or
+      // subagent counts. Both are null on a record that predates them.
+      launch_kind: fields.dispatch_launch_kind || null,
+      selection_reused: fields.dispatch_choice_reused === "1" ? true : fields.dispatch_choice_reused === "0" ? false : null,
       runtime_session: fields.dispatch_runtime_session || null,
     });
   } else {
     if (!args.outcome) fail("finish needs --outcome");
     const started = Number(fields.dispatch_started_epoch);
     const finished = Math.floor(Date.now() / 1000);
-    const runtimeObserved = collectRuntime(args.choice, fields, readRecordedSessions(args.ledger, record.task_id));
+    const generation = fields.dispatch_generation
+      || (typeof fields.dispatch_started_at === "string" && fields.dispatch_started_at ? fields.dispatch_started_at : null);
+    const launched = readRecordedLaunches(args.ledger, record.task_id, generation);
+    const runtimeObserved = collectRuntime(args.choice, fields, recordedSessions(launched));
     append(args.ledger, {
       schema_version: 1,
       event: "finish",
@@ -843,6 +916,13 @@ if (command === "launch" || command === "finish") {
       finished_at: nowISO(),
       duration_seconds: Number.isFinite(started) && started > 0 && finished >= started ? finished - started : null,
       delivery_outcome: args.outcome,
+      // Explicit incarnation totals for this task generation, scoped by the
+      // same generation token as the session aggregation above and independent
+      // of any session or subagent count the runtime observation happens to
+      // carry. A reader must not have to infer how many times the worker was
+      // launched, relaunched, or retried.
+      generation,
+      totals: launchTotals(launched),
       runtime_observed: runtimeObserved,
       usage: runtimeObserved?.usage || { status: "unknown", reason: "no task-attributable provider usage observation was supplied" },
       quality: { status: "unknown", reason: "delivery success is not evidence that no bug was found or escaped" },

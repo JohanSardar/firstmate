@@ -542,12 +542,143 @@ dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1767225600
 META
 {
-  printf '%s\n' '{"schema_version":1,"event":"launch-prepared","event_id":"launch:sessionless-task:s1","task_id":"sessionless-task","spawn_gen":"s1","effective":{"harness":"pi"}}'
-  printf '%s\n' '{"schema_version":1,"event":"launch-prepared","event_id":"launch:sessionless-task:s2","task_id":"sessionless-task","spawn_gen":"s2","effective":{"harness":"opencode"}}'
+  printf '%s\n' '{"schema_version":1,"event":"launch-prepared","event_id":"launch:sessionless-task:s1","task_id":"sessionless-task","spawn_gen":"s1","started_at":"2026-01-01T00:00:00Z","effective":{"harness":"pi"}}'
+  printf '%s\n' '{"schema_version":1,"event":"launch-prepared","event_id":"launch:sessionless-task:s2","task_id":"sessionless-task","spawn_gen":"s2","started_at":"2026-01-01T00:00:00Z","effective":{"harness":"opencode"}}'
 } > "$sessionless_dir/data/dispatch-metrics.jsonl"
 FM_DATA_OVERRIDE="$sessionless_dir/data" "$METRICS" finish \
   "$sessionless_dir/state/sessionless-task.meta" "$sessionless_dir/state/sessionless-task.dispatch-choice.json" landed || fail "sessionless cross-harness finish failed"
 sessionless_observed=$(jq -c -s 'map(select(.event=="finish"))[0] | {status: .runtime_observed.status, partial: .runtime_observed.partial, harnesses: [.runtime_observed.sessions[].harness], reason: .runtime_observed.reason}' "$sessionless_dir/data/dispatch-metrics.jsonl")
 case "$sessionless_observed" in *'"status":"unknown"'*'"partial":true'*'"pi"'*'"opencode"'*'cross-harness'*) ;; *) fail "sessionless prior incarnations were dropped from the cross-harness guard: $sessionless_observed" ;; esac
+
+# Reusing a task id after teardown must not absorb the previous task's
+# incarnations from the append-only ledger. The generation token scopes both
+# the session aggregation and the explicit totals to the current lifetime: a
+# relaunch preserves the token and a fresh task spawn mints a new one, so even
+# an identical launch origin cannot confuse the two.
+generation_dir="$TMP_ROOT/generation-scope"
+mkdir -p "$generation_dir/data" "$generation_dir/state" "$generation_dir/config/projects/worktree"
+printf '%s\n' '{"schema_version":1,"presets":{"claude-fixed":{"mode":"fixed","candidate":{"id":"opus","harness":"claude","model":"opus","effort":"medium"}}}}' > "$generation_dir/config.json"
+generation_choice=$(FM_STATE_OVERRIDE="$generation_dir/state" "$PRESET" select generation-task claude-fixed "$generation_dir/config.json") || fail "generation choice failed"
+printf '%s\n' "$generation_choice" > "$generation_dir/state/generation-task.dispatch-choice.json"
+cat > "$generation_dir/state/generation-task.meta" <<META
+harness=claude
+kind=ship
+model=opus
+effort=medium
+spawn_gen=s2
+dispatch_preset=claude-fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_runtime_session=current-session
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
+dispatch_generation=current-generation
+META
+{
+  printf '%s\n' '{"schema_version":1,"event":"launch-prepared","event_id":"launch:generation-task:old","task_id":"generation-task","spawn_gen":"old","generation":"old-generation","started_at":"2026-01-01T00:00:00Z","effective":{"harness":"claude"},"runtime_session":"old-session"}'
+  printf '%s\n' '{"schema_version":1,"event":"finish","event_id":"finish:generation-task:old","task_id":"generation-task","spawn_gen":"old","generation":"old-generation","started_at":"2026-01-01T00:00:00Z","totals":{"launches":1,"relaunches":0,"retries":0},"delivery_outcome":"landed"}'
+} > "$generation_dir/data/dispatch-metrics.jsonl"
+FM_DATA_OVERRIDE="$generation_dir/data" "$METRICS" launch \
+  "$generation_dir/state/generation-task.meta" "$generation_dir/state/generation-task.dispatch-choice.json" || fail "generation launch metric failed"
+printf '{"type":"assistant","effort":"medium","message":{"id":"msg_gen","model":"claude-opus-5","usage":{"input_tokens":7,"output_tokens":3},"content":[{"type":"text"}]}}\n' \
+  > "$generation_dir/config/projects/worktree/current-session.jsonl"
+# A transcript for the previous generation's session exists too: the scoping,
+# not the file's absence, is what must keep it out of this task's totals.
+printf '{"type":"assistant","effort":"medium","message":{"id":"msg_old","model":"claude-opus-5","usage":{"input_tokens":9000,"output_tokens":9000},"content":[{"type":"text"}]}}\n' \
+  > "$generation_dir/config/projects/worktree/old-session.jsonl"
+CLAUDE_CONFIG_DIR="$generation_dir/config" FM_DATA_OVERRIDE="$generation_dir/data" "$METRICS" finish \
+  "$generation_dir/state/generation-task.meta" "$generation_dir/state/generation-task.dispatch-choice.json" landed || fail "generation finish metric failed"
+generation_observed=$(jq -c -s 'map(select(.event=="finish"))[-1] | {session: .runtime_observed.session_id, totals: .totals, input: .runtime_observed.usage.input_tokens}' "$generation_dir/data/dispatch-metrics.jsonl")
+[ "$generation_observed" = '{"session":"current-session","totals":{"launches":1,"relaunches":0,"retries":0},"input":7}' ] \
+  || fail "a reused task id absorbed a prior generation's incarnations: $generation_observed"
+
+# The final metrics event persists explicit launch, relaunch, and retry totals
+# scoped to the same generation, so a reader never has to infer them from
+# session or subagent counts.
+totals_dir="$TMP_ROOT/launch-totals"
+mkdir -p "$totals_dir/data" "$totals_dir/state"
+printf '%s\n' '{"schema_version":1,"presets":{"claude-fixed":{"mode":"fixed","candidate":{"id":"opus","harness":"claude","model":"opus","effort":"medium"}}}}' > "$totals_dir/config.json"
+totals_choice=$(FM_STATE_OVERRIDE="$totals_dir/state" "$PRESET" select totals-task claude-fixed "$totals_dir/config.json") || fail "totals choice failed"
+printf '%s\n' "$totals_choice" > "$totals_dir/state/totals-task.dispatch-choice.json"
+write_totals_meta() {  # <spawn-gen> <kind> <reused>
+  cat > "$totals_dir/state/totals-task.meta" <<META
+harness=claude
+kind=ship
+model=opus
+effort=medium
+spawn_gen=$1
+dispatch_preset=claude-fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_launch_kind=$2
+dispatch_choice_reused=$3
+META
+}
+write_totals_meta s1 spawn 0
+FM_DATA_OVERRIDE="$totals_dir/data" "$METRICS" launch "$totals_dir/state/totals-task.meta" "$totals_dir/state/totals-task.dispatch-choice.json" || fail "spawn launch metric failed"
+write_totals_meta s2 relaunch 1
+FM_DATA_OVERRIDE="$totals_dir/data" "$METRICS" launch "$totals_dir/state/totals-task.meta" "$totals_dir/state/totals-task.dispatch-choice.json" || fail "relaunch launch metric failed"
+write_totals_meta s3 spawn 1
+FM_DATA_OVERRIDE="$totals_dir/data" "$METRICS" launch "$totals_dir/state/totals-task.meta" "$totals_dir/state/totals-task.dispatch-choice.json" || fail "retry launch metric failed"
+kinds=$(jq -c -s '[.[] | select(.event=="launch-prepared") | {kind: .launch_kind, reused: .selection_reused}]' "$totals_dir/data/dispatch-metrics.jsonl")
+[ "$kinds" = '[{"kind":"spawn","reused":false},{"kind":"relaunch","reused":true},{"kind":"spawn","reused":true}]' ] \
+  || fail "launch kinds and selection reuse were not recorded: $kinds"
+FM_DATA_OVERRIDE="$totals_dir/data" "$METRICS" finish "$totals_dir/state/totals-task.meta" "$totals_dir/state/totals-task.dispatch-choice.json" landed || fail "totals finish metric failed"
+totals_seen=$(jq -c -s 'map(select(.event=="finish"))[0].totals' "$totals_dir/data/dispatch-metrics.jsonl")
+[ "$totals_seen" = '{"launches":3,"relaunches":1,"retries":1}' ] \
+  || fail "explicit launch/relaunch/retry totals were wrong: $totals_seen"
+
+# The live extension runtime observation and the local-store collector observe
+# the same incarnation, so the merge keeps the collector's completeness status,
+# partial flag, reason, and measured effort while preserving the live fields the
+# collector cannot know, and a disagreement is recorded instead of hidden.
+merge_dir="$TMP_ROOT/runtime-merge"
+mkdir -p "$merge_dir/data" "$merge_dir/state" "$merge_dir/wt" "$merge_dir/piagent/sessions/--one--" "$merge_dir/piagent/sessions/--two--"
+printf '%s\n' '{"schema_version":1,"presets":{"pi-fixed":{"mode":"fixed","candidate":{"id":"pi","harness":"pi","model":"openai-codex/model-pi","effort":"max"}}}}' > "$merge_dir/config.json"
+merge_choice=$(FM_STATE_OVERRIDE="$merge_dir/state" "$PRESET" select merge-task pi-fixed "$merge_dir/config.json") || fail "merge choice failed"
+printf '%s\n' "$merge_choice" > "$merge_dir/state/merge-task.dispatch-choice.json"
+write_merge_meta() {  # <spawn-gen>
+  cat > "$merge_dir/state/merge-task.meta" <<META
+harness=pi
+kind=ship
+model=openai-codex/model-pi
+effort=max
+spawn_gen=$1
+worktree=$merge_dir/wt
+dispatch_preset=pi-fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1767225600
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
+META
+}
+write_merge_meta s1
+cat > "$merge_dir/state/merge-task.dispatch-runtime.json" <<'JSON'
+{"schema_version":1,"task_id":"merge-task","preset":"pi-fixed","session_id":"pi-live","model_used":"openai-codex/model-pi","effort_used":"xhigh","fast_requested":false,"fast_server_verified":false}
+JSON
+{
+  printf '{"type":"session","version":3,"id":"pi-live","timestamp":"2026-01-01T00:00:10.000Z","cwd":"%s"}\n' "$merge_dir/wt"
+  printf '%s\n' '{"type":"thinking_level_change","id":"t1","parentId":null,"timestamp":"2026-01-01T00:00:11.000Z","thinkingLevel":"max"}'
+  printf '%s\n' '{"type":"message","id":"m1","parentId":"t1","timestamp":"2026-01-01T00:00:12.000Z","message":{"role":"assistant","provider":"openai-codex","model":"model-pi","usage":{"input":100,"output":20,"cacheRead":30,"cacheWrite":5,"reasoning":7,"totalTokens":162},"stopReason":"stop"}}'
+} > "$merge_dir/piagent/sessions/--one--/2026-01-01T00-00-10-000Z_pi-live.jsonl"
+PI_CODING_AGENT_DIR="$merge_dir/piagent" FM_DATA_OVERRIDE="$merge_dir/data" "$METRICS" launch \
+  "$merge_dir/state/merge-task.meta" "$merge_dir/state/merge-task.dispatch-choice.json" || fail "merge launch metric failed"
+PI_CODING_AGENT_DIR="$merge_dir/piagent" FM_DATA_OVERRIDE="$merge_dir/data" "$METRICS" finish \
+  "$merge_dir/state/merge-task.meta" "$merge_dir/state/merge-task.dispatch-choice.json" landed || fail "merge finish metric failed"
+merged=$(jq -c -s 'map(select(.event=="finish"))[0].runtime_observed | {status, model_used, effort_used, fast_requested, usage: .usage.status, conflicts}' "$merge_dir/data/dispatch-metrics.jsonl")
+[ "$merged" = '{"status":"observed","model_used":"openai-codex/model-pi","effort_used":"max","fast_requested":false,"usage":"recorded-local","conflicts":[{"field":"effort_used","live":"xhigh","observed":"max"}]}' ] \
+  || fail "the runtime observation merge dropped collector authority or hid a conflict: $merged"
+# An unmeasurable session keeps the whole observation unknown and partial while
+# the live record's own fields survive the merge.
+printf '{"type":"session","version":3,"id":"pi-empty","timestamp":"2026-01-01T00:01:10.000Z","cwd":"%s"}\n' "$merge_dir/wt" \
+  > "$merge_dir/piagent/sessions/--two--/2026-01-01T00-01-10-000Z_pi-empty.jsonl"
+write_merge_meta s2
+PI_CODING_AGENT_DIR="$merge_dir/piagent" FM_DATA_OVERRIDE="$merge_dir/data" "$METRICS" finish \
+  "$merge_dir/state/merge-task.meta" "$merge_dir/state/merge-task.dispatch-choice.json" landed || fail "partial merge finish metric failed"
+merged_partial=$(jq -c -s 'map(select(.event=="finish"))[1].runtime_observed | {status, partial, effort_used, fast_requested, usage: .usage.status, reason}' "$merge_dir/data/dispatch-metrics.jsonl")
+case "$merged_partial" in
+  *'"status":"unknown"'*'"partial":true'*'"effort_used":"max"'*'"fast_requested":false'*'"usage":"unknown"'*'without measurable usage'*) ;;
+  *) fail "a partial collector result was not preserved through the merge: $merged_partial" ;;
+esac
 
 echo "PASS: task/model presets are deterministic, weighted, explicit on unavailability, and conservatively measured"

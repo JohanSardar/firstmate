@@ -17,7 +17,9 @@ Verified on 2026-06-11 across versions 1.15.7 through 1.17.6, with busy-queue be
 | Trust dialog | None. |
 
 Preset selection also requires a matching `opencode providers list` credential and never substitutes a similarly named contributor-free or API-billed product.
-An opt-in preset delivers `OPENCODE_CONFIG_CONTENT` with `permission` plus a per-launch primary agent carrying the exact `model` and `variant`, and launches `opencode --agent <name> --auto --prompt <brief>`; OpenCode resolves an agent-configured variant ahead of the model default, so the persistent TUI runs the sampled pair.
+An opt-in preset delivers `OPENCODE_CONFIG_CONTENT` with `permission` plus a per-launch primary agent carrying the exact `model` and `variant` (each only when that axis was explicitly requested), and launches `opencode --agent <name> --prompt <brief>`; OpenCode resolves an agent-configured variant ahead of the model default, so the persistent TUI runs the sampled pair.
+The `permission` block is the single permission mechanism and `--auto` is deliberately not passed.
+A harness switch onto OpenCode's own defaults delivers the ordinary `permission`-only configuration with no per-launch agent at all, so a default axis never reaches a launch control as the literal string `default`.
 `tests/fm-opencode-preset-agent-live-e2e.test.sh` proves that resolution against the real installed CLI (token-free).
 The task-local plugin records the model and variant OpenCode reports for later comparison, from `message.updated` assistant messages of the first session that produced one (the worker's main session); a subagent child session's messages are ignored, and `AssistantMessage` carries no variant, so the observed effort stays null.
 OpenCode can auto-upgrade in the background, and the running TUI can exit mid-task.

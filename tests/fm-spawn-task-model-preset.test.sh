@@ -225,6 +225,31 @@ runtime="$HOME_DIR/state/pi-preset-task.dispatch-runtime.json"
 [ ! -e "$HOME_DIR/user-home/.pi/agent/settings.json" ] || fail "Pi preset changed global settings"
 [ "$(jq -s -r '.[0].effective.effort' "$HOME_DIR/data/dispatch-metrics.jsonl")" = max ] || fail "validated Pi effort was not recorded effective"
 [ "$(jq -s -r '.[0].selection.selected_candidate' "$HOME_DIR/data/dispatch-metrics.jsonl")" = candidate ] || fail "Pi launch provenance was not recorded"
+[ "$(jq -s -r '.[0].launch_kind' "$HOME_DIR/data/dispatch-metrics.jsonl")" = spawn ] || fail "a fresh preset spawn did not record its launch kind"
+[ "$(jq -s -r '.[0].selection_reused' "$HOME_DIR/data/dispatch-metrics.jsonl")" = false ] || fail "a fresh preset spawn claimed to reuse a sample"
+[ -n "$(grep '^dispatch_generation=' "$HOME_DIR/state/pi-preset-task.meta" | cut -d= -f2)" ] \
+  || fail "a fresh preset spawn did not record a generation token"
+[ -n "$(jq -s -r '.[0].generation' "$HOME_DIR/data/dispatch-metrics.jsonl")" ] \
+  || fail "the launch event did not record the generation token"
+
+# A retry that finds an already-sampled durable choice records the reuse
+# explicitly, so the final metrics event can total retries without inferring
+# them from session or subagent counts.
+record=$(make_case retry-choice retry-choice-task pi openai-codex/model-pi max)
+IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
+$record
+EOF
+install_fake_pi "$FAKEBIN_DIR"
+FM_STATE_OVERRIDE="$HOME_DIR/state" "$ROOT/bin/fm-task-model-preset.sh" select retry-choice-task chosen "$HOME_DIR/config/task-model-presets.json" >/dev/null \
+  || fail "pre-sampling the durable choice for the retry failed"
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" retry-choice-task "$PROJ_DIR" "$DIR/launch.log") \
+  || fail "retry preset spawn failed: $out"
+[ "$(grep '^dispatch_choice_reused=' "$HOME_DIR/state/retry-choice-task.meta" | cut -d= -f2)" = 1 ] \
+  || fail "a spawn that reused a sampled choice did not record it"
+[ "$(jq -s -r '.[0].selection_reused' "$HOME_DIR/data/dispatch-metrics.jsonl")" = true ] \
+  || fail "the launch event did not record the reused sample"
+[ "$(jq -s -r '.[0].launch_kind' "$HOME_DIR/data/dispatch-metrics.jsonl")" = spawn ] \
+  || fail "the retry launch kind was not recorded"
 
 # A level the model does not map (here max) must refuse before launch: Pi would
 # otherwise clamp it silently to a lower level while the ledger claimed max.
@@ -369,7 +394,10 @@ launch=$(cat "$DIR/launch.log")
 case "$launch" in
   *"opencode run "*) fail "OpenCode preset launched the one-shot run subcommand: $launch" ;;
 esac
-assert_contains "$launch" "opencode --agent fm-preset-opencode-preset-task --auto --model 'vendor/model-open' --prompt" "OpenCode persistent TUI launch"
+assert_contains "$launch" "opencode --agent 'fm-preset-opencode-preset-task' --model 'vendor/model-open' --prompt" "OpenCode persistent TUI launch"
+case "$launch" in
+  *'--auto'*) fail "OpenCode preset launch added the redundant --auto approval flag: $launch" ;;
+esac
 oc_config=$(printf '%s\n' "$launch" | sed -n "s/^.*OPENCODE_CONFIG_CONTENT='\([^']*\)'.*$/\1/p" | head -1)
 [ -n "$oc_config" ] || fail "OpenCode preset launch did not carry an OPENCODE_CONFIG_CONTENT"
 [ "$(printf '%s' "$oc_config" | jq -r '.permission["*"]')" = allow ] \
@@ -443,6 +471,41 @@ if out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-switch-task -
 fi
 assert_contains "$out" "which is not in 'grok models'" "explicit override refusal detail"
 [ "$(cat "$HOME_DIR/state/pi-switch-task.meta")" = "$meta_before" ] || fail "a refused preflight rewrote the task record"
+
+# A switch that names only a model must resolve the target tool's own default
+# effort/variant instead of validating the literal string 'default': Pi skips
+# the exact-level probe for an unrequested level, and OpenCode accepts the
+# model without requiring a variant or writing one into the agent record.
+record=$(make_case model-only-switch model-only-switch-task grok grok-example xhigh)
+IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
+$record
+EOF
+install_fake_grok "$FAKEBIN_DIR"
+write_fake_grok_catalog "$HOME_DIR" 9.9.9-test '{"grok-example":{"info":{"supports_reasoning_effort":true,"reasoning_efforts":[{"id":"xhigh","value":"xhigh"},{"id":"high","value":"high"}]}}}'
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" model-only-switch-task "$PROJ_DIR" "$DIR/launch.log") \
+  || fail "Grok preset spawn for the model-only switch failed: $out"
+install_fake_pi "$FAKEBIN_DIR"
+out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" model-only-switch-task --relaunch --harness pi --model openai-codex/model-pi --preflight 2>&1) \
+  || fail "a Pi switch with an explicit model and no effort must resolve Pi's default level: $out"
+assert_contains "$out" "profile-validated harness=pi model=openai-codex/model-pi effort=default" "Pi model-only preflight profile"
+install_fake_opencode "$FAKEBIN_DIR"
+out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" model-only-switch-task --relaunch --harness opencode --model vendor/model-open --preflight 2>&1) \
+  || fail "an OpenCode switch with an explicit model and no variant must resolve OpenCode's default variant: $out"
+assert_contains "$out" "profile-validated harness=opencode model=vendor/model-open effort=default opencode-agent=fm-preset-model-only-switch-task" "OpenCode model-only preflight profile"
+out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" model-only-switch-task --relaunch --harness opencode --preflight 2>&1) \
+  || fail "an OpenCode switch with no axes must resolve the ordinary default configuration: $out"
+assert_contains "$out" "profile-validated harness=opencode model=default effort=default opencode-agent=ordinary" "OpenCode default preflight profile"
+# An explicitly requested effort without the model it belongs to cannot be
+# proven against any per-model menu, so it must stop clearly instead of being
+# written into a launch control the model may not support.
+if out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" model-only-switch-task --relaunch --harness pi --effort high --preflight 2>&1); then
+  fail "a Pi switch with an effort but no model was accepted"
+fi
+assert_contains "$out" "requested Pi effort 'high' without an explicit model" "Pi effort-without-model refusal"
+if out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" model-only-switch-task --relaunch --harness opencode --effort high --preflight 2>&1); then
+  fail "an OpenCode switch with a variant but no model was accepted"
+fi
+assert_contains "$out" "requested OpenCode effort 'high' without an explicit model" "OpenCode variant-without-model refusal"
 
 # --preflight is relaunch-only; a fresh spawn must not silently accept it.
 if out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" preflight-fresh "$PROJ_DIR" --scout --preflight 2>&1); then

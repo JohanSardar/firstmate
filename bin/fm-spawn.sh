@@ -1458,6 +1458,9 @@ DISPATCH_STARTED_EPOCH=
 DISPATCH_RUNTIME_SESSION=
 DISPATCH_TOOL_VERSION=
 DISPATCH_HARNESS_OVERRIDE=0
+DISPATCH_LAUNCH_KIND=
+DISPATCH_CHOICE_REUSED=0
+DISPATCH_GENERATION=
 if [ "$RELAUNCH" -eq 1 ]; then
   DISPATCH_PRESET=$(fm_meta_get "$RELAUNCH_META" dispatch_preset)
   if [ -n "$DISPATCH_PRESET" ]; then
@@ -1474,6 +1477,13 @@ if [ "$RELAUNCH" -eq 1 ]; then
     DISPATCH_STARTED_EPOCH=$(fm_meta_get "$RELAUNCH_META" dispatch_started_epoch)
     DISPATCH_RUNTIME_SESSION=$(fm_meta_get "$RELAUNCH_META" dispatch_runtime_session)
     DISPATCH_TOOL_VERSION=$(fm_meta_get "$RELAUNCH_META" dispatch_tool_version)
+    # Every incarnation of one preset experiment shares a generation token, so
+    # the launch ledger can scope its aggregation to this task's own lifetime
+    # even if a task id is reused later. A record written before the token
+    # existed falls back to its launch origin, which is still a generation
+    # boundary on every real spawn.
+    DISPATCH_GENERATION=$(fm_meta_get "$RELAUNCH_META" dispatch_generation)
+    [ -n "$DISPATCH_GENERATION" ] || DISPATCH_GENERATION=$DISPATCH_STARTED_AT
     command -v jq >/dev/null 2>&1 || {
       echo "error: jq is required to reuse task $ID's durable preset choice" >&2
       exit 1
@@ -1488,11 +1498,18 @@ if [ "$RELAUNCH" -eq 1 ]; then
     # harness. This runs before the caller stops the old agent (fm-control
     # preflights, then stops), so the decision is made on the pre-stop side.
     DISPATCH_SELECTED_HARNESS=$(jq -er '.selected.harness' "$DISPATCH_CHOICE_PATH") || exit 1
+    DISPATCH_LAUNCH_KIND=relaunch
+    DISPATCH_CHOICE_REUSED=1
     if [ "$ARG3" != "$DISPATCH_SELECTED_HARNESS" ]; then
       DISPATCH_HARNESS_OVERRIDE=1
       [ "$MODEL_SET" -eq 1 ] || MODEL=default
       [ "$EFFORT_SET" -eq 1 ] || EFFORT=default
       DISPATCH_FAST=
+      # The replaced harness's own tool identity is not evidence about the
+      # replacement, so both fields are cleared here and can only be
+      # repopulated by the replacement's own live checks below.
+      DISPATCH_TOOL_VERSION=
+      DISPATCH_RUNTIME_SESSION=
     fi
   fi
 elif [ "$PRESET_SET" -eq 1 ]; then
@@ -1516,6 +1533,14 @@ elif [ "$PRESET_SET" -eq 1 ]; then
     echo "error: jq is required for task/model preset dispatch" >&2
     exit 1
   }
+  DISPATCH_LAUNCH_KIND=spawn
+  DISPATCH_CHOICE_PATH="$STATE/$ID.dispatch-choice.json"
+  # A durable choice that already exists means this launch reuses a previously
+  # sampled record (the retry path) instead of making a new draw; the launch
+  # ledger records that distinction so the finish event can total retries
+  # without inferring them from session or subagent counts.
+  DISPATCH_CHOICE_REUSED=0
+  [ ! -e "$DISPATCH_CHOICE_PATH" ] || DISPATCH_CHOICE_REUSED=1
   if DISPATCH_SELECTION=$("$SCRIPT_DIR/fm-task-model-preset.sh" select "$ID" "$PRESET" "$CONFIG/task-model-presets.json"); then
     :
   else
@@ -1523,7 +1548,6 @@ elif [ "$PRESET_SET" -eq 1 ]; then
     exit "$dispatch_selection_status"
   fi
   DISPATCH_PRESET=$(printf '%s' "$DISPATCH_SELECTION" | jq -er '.preset') || exit 1
-  DISPATCH_CHOICE_PATH="$STATE/$ID.dispatch-choice.json"
   DISPATCH_MODE=$(printf '%s' "$DISPATCH_SELECTION" | jq -er '.mode') || exit 1
   DISPATCH_CONFIG_SHA256=$(printf '%s' "$DISPATCH_SELECTION" | jq -er '.config_sha256') || exit 1
   DISPATCH_SAMPLE_SHA256=$(printf '%s' "$DISPATCH_SELECTION" | jq -r '.sample_sha256 // ""') || exit 1
@@ -1539,6 +1563,13 @@ elif [ "$PRESET_SET" -eq 1 ]; then
   fi
   DISPATCH_STARTED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   DISPATCH_STARTED_EPOCH=$(date '+%s')
+  # A fresh task spawn mints its own generation token; every later relaunch
+  # preserves it, so a reused task id can never be mistaken for the previous
+  # task's generation in the launch ledger.
+  DISPATCH_GENERATION=$(node -e 'process.stdout.write(require("node:crypto").randomUUID())') || {
+    echo "error: could not mint a generation token for preset '$PRESET'" >&2
+    exit 1
+  }
 fi
 
 shell_quote() {
@@ -1571,7 +1602,14 @@ pi_supports_tui_mode() {
 
 dispatch_validate_live_settings() {
   local listing row provider model_id details auth help_text provider_label pi_agent_dir pi_package_dir pi_probe pi_plan_reason grok_catalog grok_effort_reason
+  local model_requested=0 effort_requested=0
   [ -n "$DISPATCH_PRESET" ] || return 0
+  # 'default' is not a requested setting: it means this axis was deliberately
+  # left to the selected tool's own default (a harness switch that carries no
+  # explicit model or effort). Only a requested axis can be validated against
+  # the installed tool, and a default axis must never reach a launch control.
+  [ "$MODEL" != default ] && model_requested=1
+  [ "$EFFORT" != default ] && effort_requested=1
   if [ -n "$DISPATCH_FAST" ] && [ "$HARNESS" != pi ] && [ "$HARNESS" != pi-signed ]; then
     echo "error: preset '$DISPATCH_PRESET' has a Pi fast setting that cannot be carried by relaunch harness '$HARNESS'" >&2
     return 1
@@ -1582,35 +1620,45 @@ dispatch_validate_live_settings() {
         echo "error: preset '$DISPATCH_PRESET' could not read the selected Pi catalog from $PI_BIN" >&2
         return 1
       }
-      row=$(printf '%s\n' "$listing" | awk -v wanted="$MODEL" 'NR > 1 && ($1 "/" $2) == wanted { print; exit }')
-      [ -n "$row" ] || {
-        echo "error: preset '$DISPATCH_PRESET' selected Pi model '$MODEL', which is not in '$PI_BIN --list-models'" >&2
-        return 1
-      }
-      if [ "$EFFORT" != off ] && [ "$(printf '%s\n' "$row" | awk '{print $5}')" != yes ]; then
-        echo "error: preset '$DISPATCH_PRESET' selected Pi effort '$EFFORT' for model '$MODEL', whose catalog does not advertise thinking" >&2
-        return 1
-      fi
-      provider=${MODEL%%/*}
-      [ "$provider" != "$MODEL" ] || {
-        echo "error: preset '$DISPATCH_PRESET' selected Pi model '$MODEL' without an exact provider/model id" >&2
-        return 1
-      }
-      # Pi clamps an unsupported thinking level silently, and --list-models only
-      # exposes a reasoning yes/no column, so the exact level is proven against
-      # the installed package's own model catalog (the same
-      # ModelRuntime/getSupportedThinkingLevels surface
-      # tests/fm-pi-branch-live-e2e.test.sh pins). An unprovable level refuses
-      # before launch instead of launching and silently running a lower one.
       pi_agent_dir=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
       pi_package_dir=${FM_PI_PACKAGE_DIR:-$(npm root -g 2>/dev/null)/@earendil-works/pi-coding-agent}
-      if ! pi_probe=$(node "$SCRIPT_DIR/fm-pi-reasoning-probe.mjs" \
-          --package-dir "$pi_package_dir" --agent-dir "$pi_agent_dir" \
-          --model "$MODEL" --effort "$EFFORT" 2>&1); then
-        echo "error: preset '$DISPATCH_PRESET' could not verify exact Pi reasoning support for model '$MODEL' at level '$EFFORT': $pi_probe" >&2
+      if [ "$model_requested" -eq 1 ]; then
+        row=$(printf '%s\n' "$listing" | awk -v wanted="$MODEL" 'NR > 1 && ($1 "/" $2) == wanted { print; exit }')
+        [ -n "$row" ] || {
+          echo "error: preset '$DISPATCH_PRESET' selected Pi model '$MODEL', which is not in '$PI_BIN --list-models'" >&2
+          return 1
+        }
+        if [ "$effort_requested" -eq 1 ] && [ "$EFFORT" != off ] && [ "$(printf '%s\n' "$row" | awk '{print $5}')" != yes ]; then
+          echo "error: preset '$DISPATCH_PRESET' selected Pi effort '$EFFORT' for model '$MODEL', whose catalog does not advertise thinking" >&2
+          return 1
+        fi
+        provider=${MODEL%%/*}
+        [ "$provider" != "$MODEL" ] || {
+          echo "error: preset '$DISPATCH_PRESET' selected Pi model '$MODEL' without an exact provider/model id" >&2
+          return 1
+        }
+      fi
+      # Pi clamps an unsupported thinking level silently, and --list-models only
+      # exposes a reasoning yes/no column, so an explicitly requested level is
+      # proven against the installed package's own model catalog (the same
+      # ModelRuntime/getSupportedThinkingLevels surface
+      # tests/fm-pi-branch-live-e2e.test.sh pins). An unprovable level refuses
+      # before launch instead of launching and silently running a lower one. A
+      # default axis never runs the probe and never emits a level flag, so Pi's
+      # own default applies.
+      if [ "$model_requested" -eq 0 ] && [ "$effort_requested" -eq 1 ]; then
+        echo "error: preset '$DISPATCH_PRESET' requested Pi effort '$EFFORT' without an explicit model, so its exact support cannot be proven" >&2
         return 1
       fi
-      if [ -n "$DISPATCH_FAST" ] && [ "$provider" != openai-codex ]; then
+      if [ "$model_requested" -eq 1 ] && [ "$effort_requested" -eq 1 ]; then
+        if ! pi_probe=$(node "$SCRIPT_DIR/fm-pi-reasoning-probe.mjs" \
+            --package-dir "$pi_package_dir" --agent-dir "$pi_agent_dir" \
+            --model "$MODEL" --effort "$EFFORT" 2>&1); then
+          echo "error: preset '$DISPATCH_PRESET' could not verify exact Pi reasoning support for model '$MODEL' at level '$EFFORT': $pi_probe" >&2
+          return 1
+        fi
+      fi
+      if [ -n "$DISPATCH_FAST" ] && [ "${provider:-}" != openai-codex ]; then
         echo "error: preset '$DISPATCH_PRESET' selected fast=$DISPATCH_FAST for '$MODEL'; per-worker fast control is verified only for openai-codex models" >&2
         return 1
       fi
@@ -1626,8 +1674,9 @@ dispatch_validate_live_settings() {
           return 1
         fi
       fi
-      if [ ! -f "$pi_agent_dir/auth.json" ] \
-        || ! jq -e --arg provider "$provider" 'has($provider)' "$pi_agent_dir/auth.json" >/dev/null 2>&1; then
+      if [ "$model_requested" -eq 1 ] \
+        && { [ ! -f "$pi_agent_dir/auth.json" ] \
+          || ! jq -e --arg provider "$provider" 'has($provider)' "$pi_agent_dir/auth.json" >/dev/null 2>&1; }; then
         echo "error: preset '$DISPATCH_PRESET' selected Pi provider '$provider', but no matching authenticated provider record is available" >&2
         return 1
       fi
@@ -1642,18 +1691,24 @@ dispatch_validate_live_settings() {
         echo "error: preset '$DISPATCH_PRESET' selected Grok, but the installed CLI does not report an authenticated account" >&2
         return 1
       }
-      printf '%s\n' "$listing" | sed -n 's/^  [*-] //p' | sed 's/ (default)$//' | grep -Fxq "$MODEL" || {
-        echo "error: preset '$DISPATCH_PRESET' selected Grok model '$MODEL', which is not in 'grok models'" >&2
-        return 1
-      }
+      if [ "$model_requested" -eq 1 ]; then
+        printf '%s\n' "$listing" | sed -n 's/^  [*-] //p' | sed 's/ (default)$//' | grep -Fxq "$MODEL" || {
+          echo "error: preset '$DISPATCH_PRESET' selected Grok model '$MODEL', which is not in 'grok models'" >&2
+          return 1
+        }
+      fi
       DISPATCH_TOOL_VERSION=$(grok --version 2>&1 | head -n 1)
       # Grok's advertised reasoning-effort menu varies by model (installed 1.0.30:
       # grok-4.6 advertises xhigh, grok-4.5 does not), and `grok models` exposes
-      # only ids, so the requested level is proven against the installed CLI's own
-      # fetched catalog for this exact model instead of a guessed global range. An
-      # unprovable pair refuses before launch rather than recording a control that
-      # may not exist.
-      if [ "$EFFORT" != default ]; then
+      # only ids, so an explicitly requested level is proven against the installed
+      # CLI's own fetched catalog for this exact model instead of a guessed global
+      # range. An unprovable pair refuses before launch rather than recording a
+      # control that may not exist; a default axis emits no flag.
+      if [ "$effort_requested" -eq 1 ]; then
+        [ "$model_requested" -eq 1 ] || {
+          echo "error: preset '$DISPATCH_PRESET' requested Grok effort '$EFFORT' without an explicit model, so its per-model menu cannot be proven" >&2
+          return 1
+        }
         grok_catalog=${GROK_HOME:-$HOME/.grok}/models_cache.json
         if ! grok_effort_reason=$(fm_grok_effort_evidence "$grok_catalog" \
             "$DISPATCH_TOOL_VERSION" "$MODEL" "$EFFORT"); then
@@ -1667,10 +1722,12 @@ dispatch_validate_live_settings() {
         echo "error: preset '$DISPATCH_PRESET' could not read Claude Code's launch controls" >&2
         return 1
       }
-      printf '%s\n' "$help_text" | grep -Fq "'$MODEL'" || {
-        echo "error: preset '$DISPATCH_PRESET' selected Claude model '$MODEL', which is not a current alias documented by 'claude --help'" >&2
-        return 1
-      }
+      if [ "$model_requested" -eq 1 ]; then
+        printf '%s\n' "$help_text" | grep -Fq "'$MODEL'" || {
+          echo "error: preset '$DISPATCH_PRESET' selected Claude model '$MODEL', which is not a current alias documented by 'claude --help'" >&2
+          return 1
+        }
+      fi
       claude auth status --json 2>/dev/null | jq -e '.loggedIn == true' >/dev/null || {
         echo "error: preset '$DISPATCH_PRESET' selected Claude Code, but 'claude auth status' does not report a usable login" >&2
         return 1
@@ -1678,6 +1735,27 @@ dispatch_validate_live_settings() {
       DISPATCH_TOOL_VERSION=$(claude --version 2>&1 | head -n 1)
       ;;
     opencode)
+      if [ "$model_requested" -eq 0 ]; then
+        # No axis was requested: the launch resolves to OpenCode's own default
+        # configuration with no per-launch agent override, so the only thing to
+        # prove before the old worker stops is that the installed CLI resolves
+        # at all. The default model, credential, and any variant stay exactly
+        # OpenCode's own decision.
+        if [ "$effort_requested" -eq 1 ]; then
+          echo "error: preset '$DISPATCH_PRESET' requested OpenCode effort '$EFFORT' without an explicit model; a variant belongs to one model's catalog, so it cannot be proven before launch" >&2
+          return 1
+        fi
+        if ! DISPATCH_TOOL_VERSION=$(opencode --version 2>&1); then
+          echo "error: preset '$DISPATCH_PRESET' could not resolve the installed OpenCode CLI for a default replacement launch" >&2
+          return 1
+        fi
+        DISPATCH_TOOL_VERSION=$(printf '%s\n' "$DISPATCH_TOOL_VERSION" | head -n 1)
+        [ -n "$DISPATCH_TOOL_VERSION" ] || {
+          echo "error: preset '$DISPATCH_PRESET' could not read a version from the installed OpenCode CLI for a default replacement launch" >&2
+          return 1
+        }
+        return 0
+      fi
       provider=${MODEL%%/*}
       model_id=${MODEL#*/}
       [ "$provider" != "$MODEL" ] && [ -n "$model_id" ] || {
@@ -1692,15 +1770,17 @@ dispatch_validate_live_settings() {
         echo "error: preset '$DISPATCH_PRESET' selected OpenCode model '$MODEL', which is not in the installed catalog" >&2
         return 1
       }
-      details=$(opencode models "$provider" --verbose 2>&1 | awk -v wanted="$MODEL" '
-        $0 == wanted { found=1; next }
-        found && $0 ~ /^[^[:space:]]+\/[A-Za-z0-9]/ { exit }
-        found { print }
-      ')
-      printf '%s\n' "$details" | jq -e --arg effort "$EFFORT" '.variants | type == "object" and has($effort)' >/dev/null 2>&1 || {
-        echo "error: preset '$DISPATCH_PRESET' selected OpenCode effort '$EFFORT', which model '$MODEL' does not advertise as a variant" >&2
-        return 1
-      }
+      if [ "$effort_requested" -eq 1 ]; then
+        details=$(opencode models "$provider" --verbose 2>&1 | awk -v wanted="$MODEL" '
+          $0 == wanted { found=1; next }
+          found && $0 ~ /^[^[:space:]]+\/[A-Za-z0-9]/ { exit }
+          found { print }
+        ')
+        printf '%s\n' "$details" | jq -e --arg effort "$EFFORT" '.variants | type == "object" and has($effort)' >/dev/null 2>&1 || {
+          echo "error: preset '$DISPATCH_PRESET' selected OpenCode effort '$EFFORT', which model '$MODEL' does not advertise as a variant" >&2
+          return 1
+        }
+      fi
       case "$provider" in
         opencode) provider_label='OpenCode Zen' ;;
         *) provider_label=$(printf '%s' "$provider" | tr '_-' '  ') ;;
@@ -1716,11 +1796,52 @@ dispatch_validate_live_settings() {
       DISPATCH_TOOL_VERSION=$(opencode --version 2>&1 | head -n 1)
       ;;
     *)
+      if [ "$DISPATCH_HARNESS_OVERRIDE" -eq 1 ]; then
+        # The replacement harness is outside the preset candidate vocabulary,
+        # so there is no sampled profile left to validate: the switch
+        # deliberately runs it on its own defaults, and the cleared provenance
+        # above records no claim about it.
+        return 0
+      fi
       echo "error: preset '$DISPATCH_PRESET' selected unsupported harness '$HARNESS'" >&2
       return 1
       ;;
   esac
   DISPATCH_TOOL_VERSION=$(printf '%s' "$DISPATCH_TOOL_VERSION" | tr '\r\n' ' ')
+}
+
+# The OpenCode launch configuration a preset delivers, resolved BEFORE the
+# preflight exit so the pre-stop check and the launch deliver the same shape.
+# An explicitly requested axis is carried by a per-launch agent whose model and
+# variant are exactly the requested values; a default axis is never written
+# into that record, because OpenCode would resolve the literal string 'default'
+# as a model and the launch would be unusable. When neither axis is requested
+# (a harness switch onto OpenCode's own defaults) the launch uses the same
+# ordinary configuration every non-preset OpenCode launch uses - the explicit
+# permission block only - so no per-launch agent record exists at all.
+OPENCODE_CONFIG=
+OPENCODE_AGENT_FLAG=
+resolve_opencode_preset_config() {
+  [ "$HARNESS" = opencode ] || return 0
+  OPENCODE_PRESET_AGENT=
+  OPENCODE_CONFIG='{"permission":{"*":"allow"}}'
+  OPENCODE_AGENT_FLAG=
+  if [ -z "$DISPATCH_PRESET" ] || { [ "$MODEL" = default ] && [ "$EFFORT" = default ]; }; then
+    OPENCODE_CONFIG=$(shell_quote "$OPENCODE_CONFIG")
+    return 0
+  fi
+  OPENCODE_PRESET_AGENT="fm-preset-$ID"
+  OPENCODE_CONFIG=$(jq -cn --arg agent "$OPENCODE_PRESET_AGENT" --arg model "$MODEL" --arg variant "$EFFORT" \
+    '{permission:{"*":"allow"}}
+     | .agent = {($agent): ({mode:"primary"}
+         + (if $model == "default" then {} else {model:$model} end)
+         + (if $variant == "default" then {} else {variant:$variant} end))}' ) || {
+    echo "error: preset '$DISPATCH_PRESET' could not build the OpenCode agent configuration" >&2
+    return 1
+  }
+  OPENCODE_CONFIG=$(shell_quote "$OPENCODE_CONFIG")
+  OPENCODE_AGENT_FLAG="--agent $(shell_quote "$OPENCODE_PRESET_AGENT") "
+  return 0
 }
 
 # omp pre-launch model validation. `omp models --json` (omp 18.1.11) prints
@@ -1796,18 +1917,15 @@ launch_template() {
       fi
       ;;
     opencode)
-      if [ -n "$DISPATCH_PRESET" ]; then
-        # The installed `opencode run` subcommand is one-shot (its --interactive
-        # flag does not start a persistent worker on 1.18.x), so an opt-in
-        # preset launches the long-lived TUI with a per-launch agent carrying
-        # the exact sampled model and variant. OpenCode resolves an agent's
-        # configured variant ahead of the session default, and the TUI submits
-        # the initial prompt from --prompt; the config is env-scoped to this
-        # pane, so nothing global is written.
-        printf '%s' 'OPENCODE_CONFIG_CONTENT=__OPENCODECONFIG__ opencode --agent __OPENCODEAGENT__ --auto __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
-      else
-        printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
-      fi
+      # The long-lived TUI is the verified preset worker shape (`opencode run`
+      # is one-shot). __OPENCODECONFIG__ and __OPENCODEAGENTFLAG__ are resolved
+      # by resolve_opencode_preset_config before the preflight: an explicitly
+      # requested axis is carried by the per-launch agent, while a default
+      # launch uses the ordinary configuration with no agent override at all.
+      # --auto is deliberately absent: the explicit permission block in
+      # OPENCODE_CONFIG_CONTENT is the single permission mechanism, and no
+      # unnecessary dangerous auto-approval flag is layered on top of it.
+      printf '%s' 'OPENCODE_CONFIG_CONTENT=__OPENCODECONFIG__ opencode __OPENCODEAGENTFLAG____MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       ;;
     # __PIPLAN__ is the resolved ordered extension plan (see the preset plan
     # below): an opt-in preset launch delivers --no-extensions with the task
@@ -2110,21 +2228,32 @@ if [ -n "$DISPATCH_PRESET" ] && [ -n "$DISPATCH_FAST" ]; then
       ;;
   esac
 fi
-# A harness-override relaunch uses neither the sampled model/effort nor the
-# sampled fast value, so there is no preset profile left to validate there; an
-# explicit override still runs the same checks the launch will run, which is
-# what lets fm-control's preflight refuse a bad replacement before it stops the
-# running agent.
-if [ -n "$DISPATCH_PRESET" ] \
-  && { [ "$DISPATCH_HARNESS_OVERRIDE" -eq 0 ] || [ "$MODEL_SET" -eq 1 ] || [ "$EFFORT_SET" -eq 1 ]; }; then
+# Every preset launch validates the fully resolved replacement profile: a
+# same-harness relaunch re-checks the sampled candidate, and a harness switch
+# proves the replacement tool is launchable on its own defaults (an axis that
+# was not explicitly requested is the target tool's default, never a literal
+# 'default' control) while the cleared provenance above prevents the replaced
+# harness's version or session identity from being recorded as the new one.
+# A switch onto a harness outside the preset vocabulary has no sampled profile
+# to validate and deliberately runs on that tool's own defaults instead.
+if [ -n "$DISPATCH_PRESET" ]; then
   dispatch_validate_live_settings || exit 1
 fi
+resolve_opencode_preset_config || exit 1
 # --preflight is the read-only half of a relaunch: profile resolution and the
 # same live adapter checks the launch itself runs, with every mutating step
 # still ahead of it. It exits before launch delivery so the caller can stop the
 # old agent only once the replacement profile is proven launchable.
 if [ "$PREFLIGHT" -eq 1 ]; then
-  printf 'profile-validated harness=%s model=%s effort=%s\n' "$HARNESS" "${MODEL:-default}" "${EFFORT:-default}"
+  preflight_launch=
+  if [ "$HARNESS" = opencode ]; then
+    if [ -n "$OPENCODE_PRESET_AGENT" ]; then
+      preflight_launch=" opencode-agent=$OPENCODE_PRESET_AGENT"
+    else
+      preflight_launch=' opencode-agent=ordinary'
+    fi
+  fi
+  printf 'profile-validated harness=%s model=%s effort=%s%s\n' "$HARNESS" "${MODEL:-default}" "${EFFORT:-default}" "$preflight_launch"
   exit 0
 fi
 
@@ -4124,7 +4253,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx dispatch_preset dispatch_mode dispatch_config_sha256 dispatch_sample_sha256 dispatch_fast dispatch_started_at dispatch_started_epoch dispatch_runtime_session dispatch_tool_version", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx dispatch_preset dispatch_mode dispatch_config_sha256 dispatch_sample_sha256 dispatch_fast dispatch_started_at dispatch_started_epoch dispatch_runtime_session dispatch_tool_version dispatch_launch_kind dispatch_choice_reused dispatch_generation", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -4154,6 +4283,9 @@ preserve_relaunch_meta() {
     echo "dispatch_started_epoch=$DISPATCH_STARTED_EPOCH"
     [ -z "$DISPATCH_RUNTIME_SESSION" ] || echo "dispatch_runtime_session=$DISPATCH_RUNTIME_SESSION"
     echo "dispatch_tool_version=$DISPATCH_TOOL_VERSION"
+    echo "dispatch_launch_kind=$DISPATCH_LAUNCH_KIND"
+    echo "dispatch_choice_reused=$DISPATCH_CHOICE_REUSED"
+    echo "dispatch_generation=$DISPATCH_GENERATION"
   fi
   # Default-off writes no traceparent= line.
   # backend= is written only for a non-default (non-tmux) backend, so the
@@ -4300,31 +4432,17 @@ sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 sq_worktree=$(shell_quote "$WT")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT" "$MODEL") || exit 1
-# The per-launch OpenCode config an opt-in preset delivers. The agent carries
-# the exact sampled model and variant, and OpenCode's model state prefers an
-# agent-configured variant over the model's default, so the long-lived TUI runs
-# the requested pair instead of the console default. The JSON is built with jq
-# so an exact model token cannot break the structure, and the whole content
-# stays env-scoped to this pane (never written to any OpenCode store).
-OPENCODE_PRESET_AGENT=
-OPENCODE_PRESET_CONFIG=
-if [ "$HARNESS" = opencode ] && [ -n "$DISPATCH_PRESET" ]; then
-  OPENCODE_PRESET_AGENT="fm-preset-$ID"
-  OPENCODE_PRESET_CONFIG=$(jq -cn --arg agent "$OPENCODE_PRESET_AGENT" --arg model "$MODEL" --arg variant "$EFFORT" \
-    '{permission:{"*":"allow"},agent:{($agent):{mode:"primary",model:$model,variant:$variant}}}') || {
-    echo "error: preset '$DISPATCH_PRESET' could not build the OpenCode agent configuration" >&2
-    exit 1
-  }
-  OPENCODE_PRESET_CONFIG=$(shell_quote "$OPENCODE_PRESET_CONFIG")
-fi
+# The per-launch OpenCode configuration was resolved by
+# resolve_opencode_preset_config before the preflight exit, so the profile the
+# caller validated is exactly the shape delivered here.
 SESSIONFLAG=
 [ -z "$DISPATCH_RUNTIME_SESSION" ] || SESSIONFLAG="--session-id $(shell_quote "$DISPATCH_RUNTIME_SESSION") "
 LAUNCH=${LAUNCH//__SESSIONFLAG__/$SESSIONFLAG}
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
 LAUNCH=${LAUNCH//__CLAUDEPERMFLAG__/$CLAUDE_PERM_FLAG}
-LAUNCH=${LAUNCH//__OPENCODECONFIG__/$OPENCODE_PRESET_CONFIG}
-LAUNCH=${LAUNCH//__OPENCODEAGENT__/$OPENCODE_PRESET_AGENT}
+LAUNCH=${LAUNCH//__OPENCODECONFIG__/$OPENCODE_CONFIG}
+LAUNCH=${LAUNCH//__OPENCODEAGENTFLAG__/$OPENCODE_AGENT_FLAG}
 if [ "$HARNESS" = rovo ]; then
   ROVOCONFIGOVERRIDE=$(rovo_config_override_flag "$EFFORT" "$DATA" "$STATE" "$ID") || {
     echo "error: could not resolve this task's home paths for rovo's allowedExternalPaths grant" >&2

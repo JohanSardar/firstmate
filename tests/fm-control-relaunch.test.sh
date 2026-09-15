@@ -133,6 +133,16 @@ new_case() {
   printf 'claude' > "$dir/fake/becomes"
   printf '%s\n' "fm-$id" > "$dir/fake/windows"
   make_tmux_stub "$dir"
+  # A logged-in Grok CLI for preset harness switches, which now validate the
+  # replacement tool before the old agent is stopped.
+  cat > "$dir/fakebin/grok" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  models) printf '%s\n' 'You are logged in with example.invalid.' '' 'Available models:' '  * grok-default (default)' '  - grok-example' ;;
+  --version) printf '%s\n' 'grok 9.9.9-test' ;;
+esac
+SH
+  chmod +x "$dir/fakebin/grok"
   printf '%s\n' "$dir"
 }
 
@@ -166,6 +176,49 @@ EOF
   printf '%s\n' "fm-$id" > "$dir/fake/windows"
   printf '%s' "$wt" > "$dir/fake/cwd"
   TASK_TMPS+=("/tmp/fm-$id")
+}
+
+# seed_preset_pi_task <case-dir> <id>: a live pi task carrying the opt-in
+# preset's durable sampled choice and a prior tool version/session that must
+# not survive a harness switch.
+seed_preset_pi_task() {
+  local dir=$1 id=$2
+  add_ship_task "$dir" "$id" pi
+  sed 's/^model=default$/model=openai-codex\/model-pi/; s/^effort=default$/effort=max/' \
+    "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.tmp"
+  mv "$dir/home/state/$id.meta.tmp" "$dir/home/state/$id.meta"
+  cat >> "$dir/home/state/$id.meta" <<META
+dispatch_preset=synthetic-fixed
+dispatch_mode=fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_tool_version=pi 9.9.9-old
+dispatch_runtime_session=old-pi-session
+META
+  cat > "$dir/home/state/$id.dispatch-choice.json" <<JSON
+{"schema_version":1,"task_id":"$id","preset":"synthetic-fixed","mode":"fixed","algorithm":"fixed-v1","config_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"pi-candidate","weight":null,"available":true}],"selected":{"id":"pi-candidate","harness":"pi","model":"openai-codex/model-pi","effort":"max","fast":false}}
+JSON
+}
+
+# make_opencode_stub <case-dir>: the installed OpenCode CLI surface the preset
+# checks read: the model catalog with variants, the credential listing, and the
+# version a default replacement launch resolves.
+make_opencode_stub() {
+  cat > "$1/fakebin/opencode" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  models)
+    if [ "${3:-}" = --verbose ]; then
+      printf '%s\n' 'vendor/model-open' '{' '  "variants": {' '    "xhigh": {"reasoningEffort":"xhigh"}' '  }' '}'
+    else
+      printf '%s\n' 'vendor/model-open'
+    fi
+    ;;
+  providers) printf '%s\n' 'Vendor api' ;;
+  --version) printf '%s\n' 'opencode 9.9.9-test' ;;
+esac
+SH
+  chmod +x "$1/fakebin/opencode"
 }
 
 run_control() {  # <case-dir> <args...>
@@ -640,6 +693,89 @@ JSON
     fail "the replacement launch replayed the sampled Pi thinking level"
   fi
   pass "fm-control relaunch: a preset harness switch resets the sampled axes and drops the Pi-only fast request"
+}
+
+# A preset switch to OpenCode with no explicit axes must resolve the tool's own
+# ordinary default configuration before the old worker stops, deliver that
+# exact shape, and never write the replaced harness's version or session into
+# the replacement's record.
+test_preset_switch_to_opencode_defaults_delivers_the_ordinary_configuration() {
+  local dir out rc id=rl-preset-oc-defaults
+  dir=$(new_case preset-oc-defaults "$id")
+  seed_preset_pi_task "$dir" "$id"
+  make_opencode_stub "$dir"
+  printf 'opencode' > "$dir/fake/becomes"
+  out=$(run_control "$dir" "$id" relaunch --harness opencode --note "switching to OpenCode defaults"); rc=$?
+  expect_code 0 "$rc" "a preset switch to OpenCode defaults should succeed"$'\n'"$out"
+  [ "$(meta_field "$dir" "$id" harness)" = opencode ] || fail "the record should follow the preset harness switch"
+  [ "$(meta_field "$dir" "$id" model)" = default ] || fail "an unrequested OpenCode model must stay the tool default"
+  [ "$(meta_field "$dir" "$id" effort)" = default ] || fail "an unrequested OpenCode variant must stay the tool default"
+  [ "$(meta_field "$dir" "$id" dispatch_tool_version)" = 'opencode 9.9.9-test' ] \
+    || fail "the replacement's own tool version was not established, got '$(meta_field "$dir" "$id" dispatch_tool_version)'"
+  [ -z "$(meta_field "$dir" "$id" dispatch_runtime_session)" ] \
+    || fail "the replaced harness's runtime session survived the switch"
+  [ "$(meta_field "$dir" "$id" dispatch_launch_kind)" = relaunch ] \
+    || fail "the launch kind was not recorded"
+  [ "$(meta_field "$dir" "$id" dispatch_choice_reused)" = 1 ] \
+    || fail "the reused durable sample was not recorded"
+  assert_grep "OPENCODE_CONFIG_CONTENT='{\"permission\":{\"*\":\"allow\"}}' opencode --prompt" "$dir/fake/literal" \
+    "the default OpenCode switch did not deliver the ordinary configuration"
+  assert_no_grep '"default"' "$dir/fake/literal" \
+    "the default OpenCode switch wrote the literal string default into a launch control"
+  assert_no_grep '--agent' "$dir/fake/literal" \
+    "the default OpenCode switch sent a per-launch agent record it did not need"
+  assert_no_grep '--auto' "$dir/fake/literal" \
+    "the OpenCode launch added the redundant auto-approval flag"
+  if grep -q 'pi 9.9.9-old\|old-pi-session' "$dir/home/state/$id.meta"; then
+    fail "the replaced harness's identity leaked into the replacement record"
+  fi
+  pass "fm-control relaunch: a preset switch to OpenCode defaults resolves and delivers the ordinary configuration"
+}
+
+# The same resolution must land on the pre-stop side: without a resolvable
+# OpenCode CLI the preflight refuses while the prior worker is still running,
+# so a harness switch can never strand the task with no agent.
+test_preset_switch_to_opencode_defaults_refuses_before_stop_without_the_cli() {
+  local dir out rc id=rl-preset-oc-refuse
+  dir=$(new_case preset-oc-refuse "$id")
+  seed_preset_pi_task "$dir" "$id"
+  # A deterministic unresolvable CLI: without this the developer's real
+  # `opencode` on PATH would answer the probe and hide the refusal path.
+  cat > "$dir/fakebin/opencode" <<'SH'
+#!/usr/bin/env bash
+exit 127
+SH
+  chmod +x "$dir/fakebin/opencode"
+  printf 'opencode' > "$dir/fake/becomes"
+  out=$(run_control "$dir" "$id" relaunch --harness opencode --note "switching to OpenCode defaults"); rc=$?
+  expect_code 1 "$rc" "a preset switch to an unresolvable OpenCode CLI should refuse"$'\n'"$out"
+  assert_contains "$out" "refused before stopping its agent" "the refusal should name the pre-stop validation"
+  [ "$(cat "$dir/fake/command")" = claude ] || fail "a refused preflight must leave the old agent running"
+  [ -z "$(cat "$dir/fake/literal")" ] || fail "a refused preflight must send nothing to the endpoint"
+  [ "$(meta_field "$dir" "$id" harness)" = pi ] || fail "a refused preflight must leave the durable record on the recorded harness"
+  pass "fm-control relaunch: an unresolvable OpenCode default refuses before the agent is stopped"
+}
+
+# A switch that names only a model (no effort) must resolve the target tool's
+# own default variant instead of validating the literal string 'default', and
+# the delivered agent record must carry the model without a default variant.
+test_preset_switch_with_model_only_resolves_the_tool_default_variant() {
+  local dir out rc id=rl-preset-oc-model
+  dir=$(new_case preset-oc-model "$id")
+  seed_preset_pi_task "$dir" "$id"
+  make_opencode_stub "$dir"
+  printf 'opencode' > "$dir/fake/becomes"
+  out=$(run_control "$dir" "$id" relaunch --harness opencode --model vendor/model-open --note "pinning the model"); rc=$?
+  expect_code 0 "$rc" "a model-only OpenCode switch should resolve the tool's default variant"$'\n'"$out"
+  [ "$(meta_field "$dir" "$id" model)" = vendor/model-open ] || fail "the explicit model should be recorded"
+  [ "$(meta_field "$dir" "$id" effort)" = default ] || fail "an unrequested variant should stay the tool default"
+  assert_grep "opencode --agent 'fm-preset-$id' --model 'vendor/model-open' --prompt" "$dir/fake/literal" \
+    "the model-only switch did not deliver the per-launch agent with the explicit model"
+  assert_no_grep '"default"' "$dir/fake/literal" \
+    "the model-only switch wrote the literal string default into a launch control"
+  assert_no_grep '"variant"' "$dir/fake/literal" \
+    "the model-only switch wrote an unrequested variant into the agent record"
+  pass "fm-control relaunch: a model-only switch resolves the target tool's default variant"
 }
 
 # The preflight is what keeps a bad replacement from leaving the task with no
@@ -1684,6 +1820,9 @@ test_relaunch_requires_a_note_for_a_ship_task
 test_harness_switch_moves_the_record_and_clears_prior_wiring
 test_harness_switch_does_not_carry_the_old_profile_axes
 test_harness_switch_resets_a_preset_sampled_profile_before_stop
+test_preset_switch_to_opencode_defaults_delivers_the_ordinary_configuration
+test_preset_switch_to_opencode_defaults_refuses_before_stop_without_the_cli
+test_preset_switch_with_model_only_resolves_the_tool_default_variant
 test_preset_relaunch_refuses_an_unlaunchable_replacement_before_stop
 test_harness_switch_retires_a_stale_preset_runtime_observation
 test_harness_switch_resolves_a_prefixed_recorded_harness

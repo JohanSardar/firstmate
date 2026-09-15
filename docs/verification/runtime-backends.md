@@ -1753,7 +1753,7 @@ No grok session or provider request is made by the check; it reads the CLI's own
 
 Verified on 2026-09-15 with the installed `opencode` 1.18.30 on macOS 26.5.2 arm64, token-free and offline.
 The installed `opencode run` subcommand is a one-shot batch command: its `run --interactive --auto` shape exits with the turn instead of leaving a worker pane, and its handler never reads the `--interactive` option.
-An opt-in preset therefore launches the long-lived TUI, `opencode --agent <per-launch-agent> --auto --prompt <brief>`, with the agent carrying the sampled `model` and `variant` in `OPENCODE_CONFIG_CONTENT`; OpenCode resolves an agent-configured variant ahead of the model default, so the TUI runs the exact sampled pair in the same persistent shape every ordinary OpenCode launch uses.
+An opt-in preset therefore launches the long-lived TUI, `opencode --agent <per-launch-agent> --prompt <brief>`, with the agent carrying only the explicitly requested `model` and `variant` in `OPENCODE_CONFIG_CONTENT`; its `permission` block is the single permission mechanism, and `--auto` is deliberately not passed. A harness switch onto OpenCode's own defaults delivers the ordinary `permission`-only configuration with no agent override. OpenCode resolves an agent-configured variant ahead of the model default, so the TUI runs the exact sampled pair in the same persistent shape every ordinary OpenCode launch uses.
 Run this token-free guard after every OpenCode upgrade:
 
 ```sh
