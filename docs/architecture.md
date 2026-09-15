@@ -256,6 +256,9 @@ Secondmate launches are exempt because they resolve the secondmate harness and a
 Unsupported effort values are still recorded in task meta when passed to `fm-spawn.sh`, but the launch template omits any effort flag that the selected harness does not accept.
 That keeps spawn launch compatible across claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, and omp while preserving the requested profile for later audit.
 
+An independent opt-in experiment layer, `config/task-model-presets.json`, maps an already-classified task category to one fixed launch choice or a deterministic weighted draw; `bin/fm-task-model-preset.sh` owns its validation and selection and publishes each complete sample to `state/<id>.dispatch-choice.json` before reporting it, refusing rather than substituting or reweighting when the sampled choice is unavailable.
+The selector is that file's only reader: `fm-spawn.sh` has no preset flag and session-start bootstrap only validates the file, so a preset is never activated implicitly; `docs/configuration.md` "Task/model presets" owns the schema and selection contract.
+
 ## Optional secondmates
 
 `data/secondmates.md` records persistent secondmates with natural-language scopes, project clone lists, and home paths.
