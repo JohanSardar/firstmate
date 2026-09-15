@@ -107,6 +107,10 @@ cmp -s "$case_dir/race-a.json" "$case_dir/race-b.json" || fail "concurrent selec
 choice_links=$(stat -f '%l' "$case_dir/concurrent-state/race-task.dispatch-choice.json" 2>/dev/null \
   || stat -c '%h' "$case_dir/concurrent-state/race-task.dispatch-choice.json")
 [ "$choice_links" = 1 ] || fail "durable choice did not settle to one link"
+ln "$case_dir/concurrent-state/race-task.dispatch-choice.json" "$case_dir/concurrent-state/.race-task.dispatch-choice.json.99999.0"
+FM_STATE_OVERRIDE="$case_dir/concurrent-state" "$PRESET" select race-task weighted-example "$case_dir/config.json" > "$case_dir/race-c.json" \
+  || fail "a leftover publication link blocked reuse of the durable choice"
+cmp -s "$case_dir/race-a.json" "$case_dir/race-c.json" || fail "retry beside a leftover publication link did not reuse the durable choice"
 
 cat > "$case_dir/unavailable.json" <<'JSON'
 {"schema_version":1,"presets":{"blocked":{"mode":"fixed","candidate":{"id":"disabled-product","harness":"opencode","model":"vendor/model-disabled","available":false,"unavailable_reason":"product approval is pending"}}}}

@@ -216,14 +216,7 @@ function stableChoice(config, presetName, taskID) {
 }
 
 function assertChoiceFile(path) {
-  let stat;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    stat = lstatSync(path);
-    if (!stat.isFile()) fail(`durable preset choice ${path} must be a single-link regular file`);
-    if (stat.nlink === 1) return;
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-  }
-  fail(`durable preset choice ${path} must be a single-link regular file`);
+  if (!lstatSync(path).isFile()) fail(`durable preset choice ${path} must be a regular file`);
 }
 
 function safeExistingChoice(path, taskID, presetName) {
