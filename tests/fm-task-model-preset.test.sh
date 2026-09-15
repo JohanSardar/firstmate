@@ -104,8 +104,14 @@ race_b=$!
 wait "$race_a" || fail "first concurrent selector failed"
 wait "$race_b" || fail "second concurrent selector failed"
 cmp -s "$case_dir/race-a.json" "$case_dir/race-b.json" || fail "concurrent selectors did not reuse one durable choice"
-choice_links=$(stat -f '%l' "$case_dir/concurrent-state/race-task.dispatch-choice.json" 2>/dev/null \
-  || stat -c '%h' "$case_dir/concurrent-state/race-task.dispatch-choice.json")
+# Platform-detected link count, never `stat -f || stat -c`: on Linux GNU
+# `stat -f` is filesystem stat and dumps to stdout before failing, so the
+# fallback's correct count lands behind that garbage (see bin/fm-watch.sh).
+if [ "$(uname)" = Darwin ]; then
+  choice_links=$(/usr/bin/stat -f %l "$case_dir/concurrent-state/race-task.dispatch-choice.json")
+else
+  choice_links=$(stat -c %h "$case_dir/concurrent-state/race-task.dispatch-choice.json")
+fi
 [ "$choice_links" = 1 ] || fail "durable choice did not settle to one link"
 ln "$case_dir/concurrent-state/race-task.dispatch-choice.json" "$case_dir/concurrent-state/.race-task.dispatch-choice.json.99999.0"
 FM_STATE_OVERRIDE="$case_dir/concurrent-state" "$PRESET" select race-task weighted-example "$case_dir/config.json" > "$case_dir/race-c.json" \
