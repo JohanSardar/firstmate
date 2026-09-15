@@ -157,3 +157,56 @@ else
   note "herdr $HERDR_VERSION released the pi registration after /quit under a nested shell; the stale-registration branch was not exercised by this release, the agent-free verdict still held through agent_not_found"
   pass "real herdr $HERDR_VERSION + pi $PI_VERSION: a quit pi under a nested shell recovers as dead"
 fi
+
+# --- minimal explicit fixed-fast plan ----------------------------------------
+#
+# A fixed-fast preset launch runs pi with --no-extensions and names its task
+# control extension last, so that extension's provider-request rewriter owns the
+# final payload. That isolation must still keep Herdr's own registration
+# integration loaded ahead of it, or --no-extensions would leave the worker
+# invisible to Herdr. This phase proves the explicit plan end to end with no
+# prompt and no model tokens: pi loads only the two named extensions, the task
+# extension actually executes (its load marker), and Herdr still reports a
+# lifecycle state for the pane.
+HERDR_PI_EXT="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions/herdr-agent-state.ts"
+[ -f "$HERDR_PI_EXT" ] || version_fail \
+  "the Herdr Pi integration is not installed at $HERDR_PI_EXT; a fixed-fast preset launch cannot keep the worker observable without it"
+TASK_EXT="$SCRATCH/explicit-plan-task.ts"
+PLAN_MARKER="$SCRATCH/explicit-plan-loaded"
+cat > "$TASK_EXT" <<EOF
+// Synthetic task control extension for the explicit-plan registration guard.
+// It records that it loaded and registers the provider-request rewriter that
+// must be the final handler in the delivered plan.
+import { writeFileSync } from "node:fs";
+export default function (pi: any) {
+  writeFileSync("$PLAN_MARKER", "loaded\n");
+  pi.on("before_provider_request", (event: any) => event.payload);
+}
+EOF
+PLAN_CREATE=$(lab workspace create --cwd "$SCRATCH/cwd" --label fm-pi-plan --no-focus 2>&1) \
+  || fail "could not create the explicit-plan lab workspace: $PLAN_CREATE"
+PLAN_PANE=$(printf '%s' "$PLAN_CREATE" | jq -r '.result.root_pane.pane_id // empty')
+[ -n "$PLAN_PANE" ] || fail "the explicit-plan workspace did not return a root pane id"
+PLAN_CMD=$(printf 'pi --no-extensions -e %q -e %q' "$HERDR_PI_EXT" "$TASK_EXT")
+lab pane run "$PLAN_PANE" "$PLAN_CMD" >/dev/null 2>&1 \
+  || fail "could not launch pi with the explicit fixed-fast plan"
+for _ in $(seq 1 300); do
+  [ -f "$PLAN_MARKER" ] && break
+  sleep 0.2
+done
+[ -f "$PLAN_MARKER" ] || version_fail \
+  "pi with the explicit plan never loaded the named task extension, so its final request rewriter was not delivered"
+PLAN_STATUS=
+for _ in $(seq 1 300); do
+  PLAN_STATUS=$(herdr agent get "$PLAN_PANE" --session "$SESSION" 2>/dev/null | jq -r '.result.agent.agent_status // empty')
+  case "$PLAN_STATUS" in working|idle|done|blocked) break ;; esac
+  sleep 0.2
+done
+case "$PLAN_STATUS" in
+  working|idle|done|blocked) ;;
+  *) version_fail \
+    "pi with --no-extensions plus the explicit registration and task extensions never registered with Herdr (agent get read '${PLAN_STATUS:-agent_not_found}' for 60s)" ;;
+esac
+note "pi $PI_VERSION under herdr $HERDR_VERSION: explicit plan loaded the task extension and registered $PLAN_STATUS"
+pass "real herdr $HERDR_VERSION + pi $PI_VERSION: the explicit fixed-fast plan keeps the task rewriter last and the worker observable"
+lab pane run "$PLAN_PANE" '/quit' >/dev/null 2>&1 || true

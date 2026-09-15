@@ -86,14 +86,22 @@ function findNamed(root, name, depth = 3) {
   return found;
 }
 // Every launch-prepared record for this task in its current generation, oldest
-// first. The generation is the task's own launch origin (dispatch_started_at),
-// which every relaunch preserves and a fresh spawn re-mints, so reusing a task
-// id after teardown cannot absorb a previous task's incarnations from the
-// append-only ledger. A record with an origin and one without cannot be proven
-// to belong to the same lifetime, so they never mix.
+// first. The generation token is the only scoping evidence. A task record with
+// no generation token, or any same-task launch record with none, cannot be
+// proven to belong to this task lifetime, so the scope reports incomplete
+// evidence instead of being inferred from another field such as the launch
+// origin.
 function readRecordedLaunches(ledger, taskID, generation) {
-  if (!existsSync(ledger)) return [];
+  if (typeof generation !== "string" || !generation) {
+    return {
+      status: "incomplete",
+      launches: [],
+      reason: "the task record carries no generation token, so this task lifetime's recorded launches cannot be identified",
+    };
+  }
+  if (!existsSync(ledger)) return { status: "complete", launches: [], reason: null };
   const launches = [];
+  let unscoped = 0;
   for (const line of readFileSync(ledger, "utf8").split("\n")) {
     if (!line) continue;
     let event;
@@ -103,13 +111,21 @@ function readRecordedLaunches(ledger, taskID, generation) {
       fail(`dispatch metrics ledger ${ledger} contains malformed JSON`);
     }
     if (event.event !== "launch-prepared" || event.task_id !== taskID) continue;
-    const eventGeneration = typeof event.generation === "string" && event.generation
-      ? event.generation
-      : typeof event.started_at === "string" && event.started_at ? event.started_at : null;
-    if (eventGeneration !== generation) continue;
+    if (typeof event.generation !== "string" || !event.generation) {
+      unscoped += 1;
+      continue;
+    }
+    if (event.generation !== generation) continue;
     launches.push(event);
   }
-  return launches;
+  if (unscoped > 0) {
+    return {
+      status: "incomplete",
+      launches,
+      reason: `${unscoped} launch record(s) for this task carry no generation token, so complete incarnation scoping cannot be proven`,
+    };
+  }
+  return { status: "complete", launches, reason: null };
 }
 // Every runtime session those launches recorded, oldest first, deduplicated by
 // harness+session. A relaunch re-mints the session id (Claude and Grok refuse a
@@ -130,20 +146,31 @@ function recordedSessions(launches) {
 // Explicit launch totals for the finish event, derived from the same ledger
 // records. A launch is one delivered incarnation; a relaunch is a launch that
 // replaced a running agent; a retry is a fresh spawn that reused an
-// already-sampled durable choice instead of making a new draw. Legacy records
-// without a recorded kind fall back to position (the first is the spawn), never
-// to a session or subagent count.
-function launchTotals(launches) {
+// already-sampled durable choice instead of making a new draw. The launch kind
+// and the reuse fact must be recorded explicitly: a record missing either one
+// makes the totals incomplete evidence instead of being inferred from position
+// or another field.
+function launchTotals(launches, scopingReason) {
+  if (scopingReason) {
+    return { status: "incomplete", launches: null, relaunches: null, retries: null, reason: scopingReason };
+  }
+  const missing = launches.filter((event) => (event.launch_kind !== "spawn" && event.launch_kind !== "relaunch") || typeof event.selection_reused !== "boolean");
+  if (missing.length > 0) {
+    return {
+      status: "incomplete",
+      launches: launches.length,
+      relaunches: null,
+      retries: null,
+      reason: `launch incarnation(s) without an explicit launch kind or selection reuse: ${missing.map((event) => event.spawn_gen || event.event_id || "unknown").join(",")}`,
+    };
+  }
   let relaunches = 0;
   let retries = 0;
-  launches.forEach((event, index) => {
-    const kind = event.launch_kind === "relaunch" || event.launch_kind === "spawn"
-      ? event.launch_kind
-      : index === 0 ? "spawn" : "relaunch";
-    if (kind === "relaunch") relaunches += 1;
+  for (const event of launches) {
+    if (event.launch_kind === "relaunch") relaunches += 1;
     else if (event.selection_reused === true) retries += 1;
-  });
-  return { launches: launches.length, relaunches, retries };
+  }
+  return { status: "complete", launches: launches.length, relaunches, retries };
 }
 // One Claude transcript's usage, including the Agent-tool subagent transcripts
 // that live beside the main session file. Every assistant message is counted
@@ -155,11 +182,15 @@ function launchTotals(launches) {
 function collectClaudeSession(session) {
   const root = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects");
   const matches = findNamed(root, `${session}.jsonl`, 3);
-  if (matches.length !== 1) return {
-    session_id: session,
-    status: "unknown",
-    reason: `expected one Claude transcript, found ${matches.length}`,
-  };
+  if (matches.length !== 1) {
+    const reason = `expected one Claude transcript, found ${matches.length}`;
+    return {
+      session_id: session,
+      status: "unknown",
+      reason,
+      usage: { status: "unknown", kind: "tokens", reason },
+    };
+  }
   const mainPath = matches[0];
   let model = null;
   let effort = null;
@@ -241,8 +272,17 @@ function collectClaudeSession(session) {
       : { status: "recorded-local", kind: "tokens", responses: responses + subagentResponses, subagent_responses: subagentResponses, subagent_transcripts: subagentTranscripts, ...totals, completeness: "not-proven-for-aborted-turns" },
   };
 }
+// A multi-incarnation observation is complete only when every incarnation has
+// its own complete local record. The reason names each missing incarnation
+// with that collector's own precise cause instead of a generic replacement,
+// and the block always carries an unknown usage section so a consumer never
+// has to guess why usage is unavailable.
 function incompleteRuntime(basis, observations, latest) {
   const missing = observations.filter((entry) => entry.status !== "observed" || entry.usage?.status !== "recorded-local");
+  const detail = missing
+    .map((entry) => `${entry.session_id ?? "unknown-session"} (${entry.usage?.reason ?? entry.reason ?? "no complete local record"})`)
+    .join("; ");
+  const reason = `relaunch incarnation(s) without a complete local record: ${detail}`;
   return {
     status: "unknown",
     basis,
@@ -250,7 +290,9 @@ function incompleteRuntime(basis, observations, latest) {
     sessions: observations.map((entry) => ({ session_id: entry.session_id, status: entry.usage?.status ?? entry.status })),
     model_used: latest?.model_used ?? null,
     effort_used: latest?.effort_used ?? null,
-    reason: `relaunch incarnation(s) without a complete local record: ${missing.map((entry) => entry.session_id).join(",")}`,
+    partial: true,
+    reason,
+    usage: { status: "unknown", kind: "tokens", partial: true, reason },
   };
 }
 function collectClaude(sessions) {
@@ -258,11 +300,7 @@ function collectClaude(sessions) {
   if (observations.length === 1) return observations[0];
   const latest = observations[observations.length - 1];
   if (observations.some((entry) => entry.status !== "observed" || entry.usage?.status !== "recorded-local")) {
-    const incomplete = incompleteRuntime("local-claude-transcript", observations, latest);
-    return {
-      ...incomplete,
-      usage: { status: "unknown", kind: "tokens", reason: incomplete.reason },
-    };
+    return incompleteRuntime("local-claude-transcript", observations, latest);
   }
   const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
   let responses = 0;
@@ -298,11 +336,16 @@ function collectClaude(sessions) {
 function collectGrokSession(session) {
   const root = join(process.env.GROK_HOME || join(homedir(), ".grok"), "sessions");
   const matches = findNamed(root, "summary.json", 3).filter((path) => path.split("/").includes(session));
-  if (matches.length !== 1) return {
-    session_id: session,
-    status: "unknown",
-    reason: `expected one Grok session summary, found ${matches.length}`,
-  };
+  if (matches.length !== 1) {
+    const reason = `expected one Grok session summary, found ${matches.length}`;
+    return {
+      session_id: session,
+      status: "unknown",
+      basis: "local-grok-session-summary",
+      reason,
+      usage: { status: "unknown", kind: "tokens", reason },
+    };
+  }
   const summary = readJson(matches[0], "Grok session summary");
   const observation = {
     session_id: session,
@@ -392,12 +435,15 @@ function taskStartedEpoch(fields) {
   const value = Number(fields.dispatch_started_epoch);
   return Number.isFinite(value) && value > 0 ? value : null;
 }
-// A session is task-attributable only when it began at (or within a small
-// clock-skew window after) this task's launch. Without the bound, a reused
-// worktree path could pull a previous task's sessions into this task's totals.
+// A session is task-attributable only when it began at or after this task's
+// recorded dispatch start. Without the bound, a reused worktree path could
+// pull a previous task's sessions into this task's totals. There is
+// deliberately no pre-launch allowance: a session that started before this
+// generation's dispatch belongs to whatever ran in the slot before it, and the
+// launch timestamp is recorded before the worker is ever delivered.
 function withinTaskWindow(startedEpoch, startMillis) {
   if (startedEpoch === null || !Number.isFinite(startMillis)) return true;
-  return startMillis / 1000 >= startedEpoch - 300;
+  return startMillis / 1000 >= startedEpoch;
 }
 // Reading a session header should not cost a full transcript read: a Pi session
 // JSONL grows with every turn, and the sessions scan only needs line one.
@@ -433,6 +479,22 @@ function unusableObservation(basis, entries, latest, reason) {
     sessions: entries,
     model_used: latest?.model_used ?? null,
     effort_used: latest?.effort_used ?? null,
+    partial: true,
+    reason,
+    usage: { status: "unknown", kind: "tokens", partial: true, reason },
+  };
+}
+// The finish event's observation when the launch ledger itself cannot be
+// scoped to one task lifetime. Nothing is collected from a scope that cannot
+// be proven, and the unknown usage block carries the scoping reason.
+function incompleteScopedRuntime(reason) {
+  return {
+    status: "unknown",
+    basis: "local-launch-ledger",
+    session_id: null,
+    sessions: [],
+    model_used: null,
+    effort_used: null,
     partial: true,
     reason,
     usage: { status: "unknown", kind: "tokens", partial: true, reason },
@@ -820,10 +882,76 @@ function collectRuntime(choicePath, fields, recordedSessions) {
     if (recordedSessions.length > 0) collected = collectOpencodeTaskUsage(worktree, startedEpoch);
   }
   if (runtime) {
-    if (!collected) return runtime;
+    if (!collected) {
+      // The live observation exists but no local collector could attribute
+      // usage to this incarnation; report that as an explicit unknown usage
+      // block instead of returning a record with no usage section at all.
+      return mergeRuntimeObservation(runtime, usageUnknown("local-launch-ledger", "no local session collector could attribute usage to this task generation"));
+    }
     return mergeRuntimeObservation(runtime, collected);
   }
+  if (!collected) return usageUnknown("local-launch-ledger", "no launch incarnation was recorded for this task generation, so no local usage can be attributed");
   return collected;
+}
+// The defect origins a quality observation may attribute a recorded defect to.
+// The set is deliberately exhaustive and conservative: a defect that cannot be
+// attributed from evidence stays unknown rather than defaulting to the worker
+// that happened to be running.
+const DEFECT_ORIGINS = new Set(["original-implementation-worker", "validation-correction", "pre-existing-code", "unknown"]);
+// The finish event's defect attribution. Only an explicit origin recorded by an
+// observation event counts as evidence: a bare quality status never implies
+// who caused a defect, and disagreeing recorded origins stay unknown rather
+// than being resolved by the most common one.
+function defectAttribution(ledger, taskID) {
+  const evidence = [];
+  if (existsSync(ledger)) {
+    for (const line of readFileSync(ledger, "utf8").split("\n")) {
+      if (!line) continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        fail(`dispatch metrics ledger ${ledger} contains malformed JSON`);
+      }
+      if (event.event !== "observation" || event.task_id !== taskID || !object(event.quality)) continue;
+      const origin = event.quality.defect_origin;
+      if (typeof origin !== "string" || !DEFECT_ORIGINS.has(origin)) continue;
+      evidence.push({
+        origin,
+        explicit: event.quality.defect_origin_explicit === true,
+        status: event.quality.status ?? null,
+        basis: event.quality.defect_origin_basis ?? event.quality.basis ?? null,
+        event_id: event.event_id ?? null,
+      });
+    }
+  }
+  const explicitUnknown = evidence.filter((entry) => entry.origin === "unknown" && entry.explicit);
+  const explicit = evidence.filter((entry) => entry.origin !== "unknown");
+  if (explicitUnknown.length > 0) {
+    return {
+      origin: "unknown",
+      basis: "at least one recorded defect was explicitly left without a proven origin",
+      evidence,
+    };
+  }
+  if (explicit.length === 0) {
+    return {
+      origin: "unknown",
+      basis: evidence.length === 0
+        ? "no defect origin was observed for this task"
+        : "every recorded defect origin was unknown",
+      evidence,
+    };
+  }
+  const origins = [...new Set(explicit.map((entry) => entry.origin))];
+  if (origins.length !== 1) {
+    return { origin: "unknown", basis: `recorded defect origins disagree (${origins.join(", ")})`, evidence };
+  }
+  return {
+    origin: origins[0],
+    basis: `recorded by explicit defect-origin observation(s) ${explicit.map((entry) => entry.event_id).join(", ")}`,
+    evidence,
+  };
 }
 function launchSettings(record, fields) {
   const requested = record.selected;
@@ -845,7 +973,10 @@ function launchSettings(record, fields) {
       // until response evidence exists.
       fast: null,
       fast_basis: requestedFast === null ? null : "requested-not-wire-verified",
-      basis: "validated-launch-control",
+      // The recorded basis is the launcher's own evidence of what it proved.
+      // A missing field is unknown, never an assumption that the axes were
+      // validated.
+      basis: fields.dispatch_validation_basis || "unknown",
       server_verified: false,
       tool_version: fields.dispatch_tool_version || null,
     },
@@ -885,13 +1016,15 @@ if (command === "launch" || command === "finish") {
       started_at: fields.dispatch_started_at || null,
       // The generation token scopes this launch to one task lifetime; a
       // relaunch preserves it and a fresh spawn mints a new one, so a reused
-      // task id cannot absorb a previous task's incarnations. Records written
-      // before the token existed carry only the launch origin.
+      // task id cannot absorb a previous task's incarnations. A record without
+      // one stays null and the finish event reports incomplete evidence rather
+      // than inferring a generation from another field.
       generation: fields.dispatch_generation || null,
       // The launch kind and whether this launch reused an already-sampled
       // durable choice are recorded so the finish event can total launches,
       // relaunches, and retries without inferring them from session or
-      // subagent counts. Both are null on a record that predates them.
+      // subagent counts. A record that lacks either stays null and makes the
+      // totals incomplete evidence.
       launch_kind: fields.dispatch_launch_kind || null,
       selection_reused: fields.dispatch_choice_reused === "1" ? true : fields.dispatch_choice_reused === "0" ? false : null,
       runtime_session: fields.dispatch_runtime_session || null,
@@ -900,10 +1033,14 @@ if (command === "launch" || command === "finish") {
     if (!args.outcome) fail("finish needs --outcome");
     const started = Number(fields.dispatch_started_epoch);
     const finished = Math.floor(Date.now() / 1000);
-    const generation = fields.dispatch_generation
-      || (typeof fields.dispatch_started_at === "string" && fields.dispatch_started_at ? fields.dispatch_started_at : null);
+    // No compatibility fallback: the generation token is the only scoping
+    // evidence for this task lifetime, and a record without one is reported
+    // as incomplete rather than inferred from its launch origin.
+    const generation = typeof fields.dispatch_generation === "string" && fields.dispatch_generation ? fields.dispatch_generation : null;
     const launched = readRecordedLaunches(args.ledger, record.task_id, generation);
-    const runtimeObserved = collectRuntime(args.choice, fields, recordedSessions(launched));
+    const runtimeObserved = launched.status === "complete"
+      ? collectRuntime(args.choice, fields, recordedSessions(launched.launches))
+      : incompleteScopedRuntime(launched.reason);
     append(args.ledger, {
       schema_version: 1,
       event: "finish",
@@ -920,12 +1057,16 @@ if (command === "launch" || command === "finish") {
       // same generation token as the session aggregation above and independent
       // of any session or subagent count the runtime observation happens to
       // carry. A reader must not have to infer how many times the worker was
-      // launched, relaunched, or retried.
+      // launched, relaunched, or retried, and a record missing either scoping
+      // field reports incomplete totals instead of a guessed count.
       generation,
-      totals: launchTotals(launched),
+      totals: launchTotals(launched.launches, launched.status === "complete" ? null : launched.reason),
       runtime_observed: runtimeObserved,
       usage: runtimeObserved?.usage || { status: "unknown", reason: "no task-attributable provider usage observation was supplied" },
-      quality: { status: "unknown", reason: "delivery success is not evidence that no bug was found or escaped" },
+      // Delivery success and a bare quality status are never evidence that no
+      // bug was found or escaped, and a recorded defect is attributed to a
+      // specific party only when an explicit observation says so.
+      quality: { status: "unknown", reason: "delivery success is not evidence that no bug was found or escaped", defect_attribution: defectAttribution(args.ledger, record.task_id) },
       cost: {
         kind: "subscription-quota-share",
         status: "unknown",
@@ -966,7 +1107,26 @@ if (command === "observe") {
     if (!["passed", "bug-found", "bug-escaped", "unknown"].includes(args.quality)) {
       fail("--quality must be passed, bug-found, bug-escaped, or unknown");
     }
-    event.quality = { status: args.quality, basis: args.basis || "operator-observation" };
+    const defectOriginExplicit = Object.hasOwn(args, "defect-origin");
+    if (defectOriginExplicit) {
+      if (!["bug-found", "bug-escaped"].includes(args.quality)) {
+        fail("--defect-origin applies only to a bug-found or bug-escaped quality observation");
+      }
+      if (!DEFECT_ORIGINS.has(args["defect-origin"])) {
+        fail("--defect-origin must be original-implementation-worker, validation-correction, pre-existing-code, or unknown");
+      }
+    }
+    // A bare quality status never implies a defect origin: without an explicit
+    // --defect-origin the attribution is unknown and says why.
+    event.quality = {
+      status: args.quality,
+      basis: args.basis || "operator-observation",
+      defect_origin: defectOriginExplicit ? args["defect-origin"] : "unknown",
+      defect_origin_explicit: defectOriginExplicit,
+      defect_origin_basis: defectOriginExplicit
+        ? args.basis || "operator-observation"
+        : "no defect origin evidence was supplied with this observation",
+    };
   }
   if (args.usage) {
     let usage;

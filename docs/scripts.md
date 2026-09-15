@@ -110,7 +110,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-task-model-preset.sh` | Validate opt-in `config/task-model-presets.json` and publish one durable fixed or weighted choice per task ([configuration.md](configuration.md#taskmodel-presets-configtask-model-presetsjson)) |
 | `fm-task-model-preset.mjs` | The JSON validation and selection engine behind `fm-task-model-preset.sh` |
 | `fm-pi-reasoning-probe.mjs` | Prove an opt-in preset's exact Pi thinking level against the installed package's own local model catalog (catalog network refresh disabled) before launch |
-| `fm-pi-launch-plan-lib.sh` | Pure owner of the resolved Pi launch-plan fast guarantee (`--no-extensions` with the task extension last) |
+| `fm-pi-launch-plan-lib.sh` | Pure owner of the resolved Pi launch-plan fast guarantee (only the verified registration-only backend integration before the task extension, which stays last) |
+| `fm-herdr-pi-registration-lib.sh` | Prove the installed Herdr Pi integration is the marked, registration-only file a fixed-fast launch may load before the task extension |
 | `fm-grok-effort-lib.sh`  | Prove an opt-in preset's Grok reasoning effort against the selected model's own advertised menu in the installed CLI's fetched catalog |
 | `fm-dispatch-metrics.sh` | Append preset launch, finish, and later observation events to the private `data/dispatch-metrics.jsonl` comparison ledger |
 | `fm-vendor-auth-probe.sh`| Run one hard-bounded, non-destructive authentication probe of a named vendor CLI and report the fact |

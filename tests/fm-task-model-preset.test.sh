@@ -156,6 +156,10 @@ dispatch_fast=off
 dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1
 dispatch_tool_version=pi-test
+dispatch_validation_basis=validated-launch-control
+dispatch_generation=metric-generation
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
 META
 FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" launch "$metrics_dir/state/metric-task.meta" "$metrics_dir/state/metric-task.dispatch-choice.json" || fail "launch metric failed"
 FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" finish "$metrics_dir/state/metric-task.meta" "$metrics_dir/state/metric-task.dispatch-choice.json" landed || fail "finish metric failed"
@@ -163,13 +167,52 @@ ledger="$metrics_dir/data/dispatch-metrics.jsonl"
 [ "$(jq -s 'map(select(.event=="launch-prepared")) | length' "$ledger")" -eq 1 ] || fail "launch event missing"
 [ "$(jq -s 'map(select(.event=="finish")) | length' "$ledger")" -eq 1 ] || fail "finish event missing"
 [ "$(jq -s -r 'map(select(.event=="finish"))[0].quality.status' "$ledger")" = unknown ] || fail "missing quality was not kept unknown"
+[ "$(jq -s -r 'map(select(.event=="finish"))[0].quality.defect_attribution.origin' "$ledger")" = unknown ] || fail "a finish without defect evidence did not stay conservatively unknown"
+[ "$(jq -s -r 'map(select(.event=="finish"))[0].quality.defect_attribution.evidence | length' "$ledger")" -eq 0 ] || fail "a finish without defect evidence invented evidence"
 [ "$(jq -s -r 'map(select(.event=="finish"))[0].cost.billing_basis' "$ledger")" = estimate-not-invoice ] || fail "cost was not labeled as an estimate"
 [ "$(jq -s -r 'map(select(.event=="launch-prepared"))[0].effective.fast' "$ledger")" = null ] || fail "requested fast was claimed as effective"
 [ "$(jq -s -r 'map(select(.event=="launch-prepared"))[0].effective.fast_basis' "$ledger")" = requested-not-wire-verified ] || fail "fast basis was not requested-only"
+[ "$(jq -s -r 'map(select(.event=="launch-prepared"))[0].effective.basis' "$ledger")" = validated-launch-control ] || fail "the launcher's recorded validation basis was not carried into the ledger"
+[ "$(jq -s -r 'map(select(.event=="finish"))[0].totals.status' "$ledger")" = complete ] || fail "explicit launch totals were not complete"
 FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --model-used vendor/model-runtime --effort-used high --fast-server-verified off --quality bug-found --quota-fraction 0.1 --monthly-price-usd 80 --reset-days 7 || fail "observation metric failed"
 [ "$(jq -s -r 'map(select(.event=="observation"))[0].cost.weekly_usd' "$ledger")" = 2 ] || fail "weekly estimate formula is wrong"
+[ "$(jq -s -r 'map(select(.event=="observation"))[0].quality.defect_origin' "$ledger")" = unknown ] || fail "a bare bug-found status implied a defect origin"
+[ "$(jq -s -r 'map(select(.event=="observation"))[0].quality.defect_origin_explicit' "$ledger")" = false ] || fail "an unsupplied defect origin was recorded as explicit"
 FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --quota-fraction 0.1 --monthly-price-usd 80 --reset-days 30 || fail "monthly-period observation failed"
 [ "$(jq -s -r 'map(select(.event=="observation"))[1].cost.status' "$ledger")" = unknown ] || fail "incompatible reset period was presented as weekly cost"
+
+# A defect origin is evidence from an operator observation, never inferred from
+# a quality status. Explicit origins are recorded with their basis and only a
+# single agreed origin is attributed by the finish event.
+set +e
+defect_bad_quality=$(FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --quality passed --defect-origin pre-existing-code 2>&1)
+defect_bad_quality_rc=$?
+set -e
+[ "$defect_bad_quality_rc" -ne 0 ] || fail "a defect origin was accepted on a passed quality status"
+assert_contains "$defect_bad_quality" "--defect-origin applies only to a bug-found or bug-escaped quality observation" "defect-origin quality scope"
+set +e
+defect_bad_origin=$(FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --quality bug-found --defect-origin flaky-implementation 2>&1)
+defect_bad_origin_rc=$?
+set -e
+[ "$defect_bad_origin_rc" -ne 0 ] || fail "an unknown defect origin value was accepted"
+assert_contains "$defect_bad_origin" "--defect-origin must be" "defect-origin vocabulary"
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --quality bug-found --defect-origin original-implementation-worker --basis "reproduced from the original change" || fail "explicit defect-origin observation failed"
+[ "$(jq -s -r 'map(select(.event=="observation"))[2].quality.defect_origin' "$ledger")" = original-implementation-worker ] || fail "an explicit defect origin was not recorded"
+[ "$(jq -s -r 'map(select(.event=="observation"))[2].quality.defect_origin_basis' "$ledger")" = "reproduced from the original change" ] || fail "the defect-origin evidence was not recorded"
+sed 's/^spawn_gen=s1$/spawn_gen=s2/' "$metrics_dir/state/metric-task.meta" > "$metrics_dir/state/metric-task.meta.tmp"
+mv "$metrics_dir/state/metric-task.meta.tmp" "$metrics_dir/state/metric-task.meta"
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" finish "$metrics_dir/state/metric-task.meta" "$metrics_dir/state/metric-task.dispatch-choice.json" landed || fail "defect attribution finish failed"
+[ "$(jq -s -r 'map(select(.event=="finish"))[1].quality.defect_attribution.origin' "$ledger")" = original-implementation-worker ] || fail "a single explicit defect origin was not attributed"
+[ "$(jq -s -r 'map(select(.event=="finish"))[1].quality.defect_attribution.evidence | length' "$ledger")" -eq 2 ] || fail "every recorded observation was not kept as evidence"
+# An explicitly unattributed defect blocks a task-level origin even when other
+# defects were attributed, because one recorded defect without a proven cause
+# makes the task-level claim unprovable.
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --quality bug-escaped --defect-origin unknown --basis "the failing change could not be isolated" || fail "explicit unknown defect-origin observation failed"
+sed 's/^spawn_gen=s2$/spawn_gen=s3/' "$metrics_dir/state/metric-task.meta" > "$metrics_dir/state/metric-task.meta.tmp"
+mv "$metrics_dir/state/metric-task.meta.tmp" "$metrics_dir/state/metric-task.meta"
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" finish "$metrics_dir/state/metric-task.meta" "$metrics_dir/state/metric-task.dispatch-choice.json" landed || fail "mixed defect attribution finish failed"
+[ "$(jq -s -r 'map(select(.event=="finish"))[2].quality.defect_attribution.origin' "$ledger")" = unknown ] || fail "an explicitly unattributed defect was hidden behind another origin"
+[ "$(jq -s -r 'map(select(.event=="finish"))[2].quality.defect_attribution.basis' "$ledger")" = "at least one recorded defect was explicitly left without a proven origin" ] || fail "the mixed-attribution reason was not recorded"
 
 claude_dir="$TMP_ROOT/claude"
 mkdir -p "$claude_dir/data" "$claude_dir/state" "$claude_dir/config/projects/worktree"
@@ -187,6 +230,9 @@ dispatch_preset=claude-fixed
 dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1
 dispatch_runtime_session=$2
+dispatch_generation=claude-generation
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
 META
 }
 # Claude Code writes one transcript line per assistant content block; every
@@ -233,6 +279,15 @@ observed=$(jq -c -s 'map(select(.event=="finish"))[1] | {status: .runtime_observ
 [ "$observed" = '{"status":"observed","model":"claude-opus-5","usage":"unknown"}' ] \
   || fail "Claude usage without message identity was not kept unknown: $observed"
 
+# A missing Claude transcript keeps the observation unknown with its own
+# precise reason and an explicit unknown usage block, never a bare reason.
+write_claude_meta s3 99999999-9999-9999-9999-999999999999
+CLAUDE_CONFIG_DIR="$claude_dir/config" FM_DATA_OVERRIDE="$claude_dir/data" "$METRICS" finish \
+  "$claude_dir/state/claude-task.meta" "$claude_dir/state/claude-task.dispatch-choice.json" landed || fail "Claude missing-transcript finish metric failed"
+claude_missing=$(jq -c -s 'map(select(.event=="finish"))[2] | {status: .runtime_observed.status, usage: .usage.status, reason: .usage.reason}' "$claude_ledger")
+[ "$claude_missing" = '{"status":"unknown","usage":"unknown","reason":"expected one Claude transcript, found 0"}' ] \
+  || fail "a missing Claude transcript did not carry its precise unknown usage block: $claude_missing"
+
 # A relaunch re-mints the runtime session id and records a second
 # launch-prepared event. The finish event must aggregate every recorded
 # incarnation instead of counting only the last one, and it must stay unknown
@@ -253,14 +308,17 @@ dispatch_preset=claude-fixed
 dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1
 dispatch_runtime_session=$2
+dispatch_generation=relaunch-generation
+dispatch_launch_kind=$3
+dispatch_choice_reused=1
 META
 }
 session_a=aaaaaaaa-1111-2222-3333-444444444444
 session_b=bbbbbbbb-1111-2222-3333-444444444444
-write_relaunch_meta s1 "$session_a"
+write_relaunch_meta s1 "$session_a" spawn
 FM_DATA_OVERRIDE="$relaunch_dir/data" "$METRICS" launch \
   "$relaunch_dir/state/relaunch-task.meta" "$relaunch_dir/state/relaunch-task.dispatch-choice.json" || fail "first incarnation launch metric failed"
-write_relaunch_meta s2 "$session_b"
+write_relaunch_meta s2 "$session_b" relaunch
 FM_DATA_OVERRIDE="$relaunch_dir/data" "$METRICS" launch \
   "$relaunch_dir/state/relaunch-task.meta" "$relaunch_dir/state/relaunch-task.dispatch-choice.json" || fail "second incarnation launch metric failed"
 {
@@ -279,7 +337,7 @@ aggregated=$(jq -c -s 'map(select(.event=="finish"))[0].runtime_observed | {stat
 # Drop the latest incarnation's transcript: the finish event must not present a
 # partial sum as a recorded observation.
 rm -f "$relaunch_dir/config/projects/worktree/$session_b.jsonl"
-write_relaunch_meta s3 "$session_b"
+write_relaunch_meta s3 "$session_b" relaunch
 CLAUDE_CONFIG_DIR="$relaunch_dir/config" FM_DATA_OVERRIDE="$relaunch_dir/data" "$METRICS" finish \
   "$relaunch_dir/state/relaunch-task.meta" "$relaunch_dir/state/relaunch-task.dispatch-choice.json" landed || fail "relaunch partial finish metric failed"
 partial=$(jq -c -s 'map(select(.event=="finish"))[1] | {status: .runtime_observed.status, sessions: .runtime_observed.sessions, usage: .usage.status, reason: .runtime_observed.usage.reason}' "$relaunch_ledger")
@@ -307,14 +365,17 @@ dispatch_preset=claude-fixed
 dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1
 dispatch_runtime_session=$4
+dispatch_generation=cross-generation
+dispatch_launch_kind=$5
+dispatch_choice_reused=1
 META
 }
 cross_claude=cccccccc-1111-2222-3333-444444444444
 cross_grok=dddddddd-1111-2222-3333-444444444444
-write_cross_meta claude opus s1 "$cross_claude"
+write_cross_meta claude opus s1 "$cross_claude" spawn
 FM_DATA_OVERRIDE="$cross_dir/data" "$METRICS" launch \
   "$cross_dir/state/cross-task.meta" "$cross_dir/state/cross-task.dispatch-choice.json" || fail "claude incarnation launch metric failed"
-write_cross_meta grok grok-4.6 s2 "$cross_grok"
+write_cross_meta grok grok-4.6 s2 "$cross_grok" relaunch
 FM_DATA_OVERRIDE="$cross_dir/data" "$METRICS" launch \
   "$cross_dir/state/cross-task.meta" "$cross_dir/state/cross-task.dispatch-choice.json" || fail "grok incarnation launch metric failed"
 # The claude incarnation has a complete local transcript; the grok incarnation
@@ -322,7 +383,7 @@ FM_DATA_OVERRIDE="$cross_dir/data" "$METRICS" launch \
 printf '{"type":"assistant","effort":"medium","message":{"id":"msg_a","model":"claude-opus-5","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5,"output_tokens":30,"output_tokens_details":{"thinking_tokens":7},"speed":"standard","service_tier":"priority"},"content":[{"type":"text"}]}}\n' \
   > "$cross_dir/config/projects/worktree/$cross_claude.jsonl"
 # Finish on the claude incarnation, whose transcript is complete.
-write_cross_meta claude opus s3 "$cross_claude"
+write_cross_meta claude opus s3 "$cross_claude" relaunch
 CLAUDE_CONFIG_DIR="$cross_dir/config" FM_DATA_OVERRIDE="$cross_dir/data" "$METRICS" finish \
   "$cross_dir/state/cross-task.meta" "$cross_dir/state/cross-task.dispatch-choice.json" landed || fail "cross-harness finish metric failed"
 cross_ledger="$cross_dir/data/dispatch-metrics.jsonl"
@@ -352,17 +413,20 @@ dispatch_preset=claude-fixed
 dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1
 dispatch_runtime_session=$2
+dispatch_generation=same-generation
+dispatch_launch_kind=$3
+dispatch_choice_reused=$4
 META
 }
 same_a=aaaaaaaa-1111-2222-3333-444444444401
 same_b=bbbbbbbb-1111-2222-3333-444444444402
-write_same_meta s1 "$same_a"
+write_same_meta s1 "$same_a" spawn 0
 FM_DATA_OVERRIDE="$same_dir/data" "$METRICS" launch "$same_dir/state/same-task.meta" "$same_dir/state/same-task.dispatch-choice.json" || fail "same-harness first launch metric failed"
-write_same_meta s2 "$same_b"
+write_same_meta s2 "$same_b" relaunch 1
 FM_DATA_OVERRIDE="$same_dir/data" "$METRICS" launch "$same_dir/state/same-task.meta" "$same_dir/state/same-task.dispatch-choice.json" || fail "same-harness second launch metric failed"
 printf '{"type":"assistant","effort":"medium","message":{"id":"msg_a","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":30},"content":[{"type":"text"}]}}\n' > "$same_dir/config/projects/worktree/$same_a.jsonl"
 printf '{"type":"assistant","effort":"medium","message":{"id":"msg_b","model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2},"content":[{"type":"text"}]}}\n' > "$same_dir/config/projects/worktree/$same_b.jsonl"
-write_same_meta s3 "$same_b"
+write_same_meta s3 "$same_b" relaunch 1
 CLAUDE_CONFIG_DIR="$same_dir/config" FM_DATA_OVERRIDE="$same_dir/data" "$METRICS" finish \
   "$same_dir/state/same-task.meta" "$same_dir/state/same-task.dispatch-choice.json" landed || fail "same-harness finish metric failed"
 same_observed=$(jq -c -s 'map(select(.event=="finish"))[0] | {status: .runtime_observed.status, usage: .usage.status, incarnations: .runtime_observed.usage.incarnations, responses: .runtime_observed.usage.responses, input: .runtime_observed.usage.input_tokens, output: .runtime_observed.usage.output_tokens}' "$same_dir/data/dispatch-metrics.jsonl")
@@ -389,6 +453,9 @@ dispatch_preset=grok-fixed
 dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1
 dispatch_runtime_session=01a0-grok
+dispatch_generation=grok-generation
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
 META
 }
 write_grok_meta s1
@@ -412,6 +479,54 @@ GROK_HOME="$grok_dir/grokhome" FM_DATA_OVERRIDE="$grok_dir/data" "$METRICS" fini
 grok_partial=$(jq -c -s 'map(select(.event=="finish"))[1] | {status: .runtime_observed.status, usage: .usage.status, reason: .runtime_observed.usage.reason}' "$grok_dir/data/dispatch-metrics.jsonl")
 case "$grok_partial" in *'"usage":"unknown"'*'no local Grok usage.json'*) ;; *) fail "a missing Grok usage.json was not kept unknown: $grok_partial" ;; esac
 
+# A Grok relaunch aggregates every recorded incarnation, and when any one of
+# them lacks its local usage record the whole observation stays unknown with
+# that incarnation's own precise reason and an explicit unknown usage block.
+grok_relaunch="$TMP_ROOT/grok-relaunch"
+mkdir -p "$grok_relaunch/data" "$grok_relaunch/state" "$grok_relaunch/grokhome/sessions/%2Ftmp%2Fgrok-relaunch-wt/01a0-grok-a" "$grok_relaunch/grokhome/sessions/%2Ftmp%2Fgrok-relaunch-wt/01a0-grok-b"
+printf '%s\n' '{"schema_version":1,"presets":{"grok-fixed":{"mode":"fixed","candidate":{"id":"grok","harness":"grok","model":"grok-4.6","effort":"xhigh"}}}}' > "$grok_relaunch/config.json"
+grok_relaunch_choice=$(FM_STATE_OVERRIDE="$grok_relaunch/state" "$PRESET" select grok-relaunch-task grok-fixed "$grok_relaunch/config.json") || fail "Grok relaunch choice failed"
+printf '%s\n' "$grok_relaunch_choice" > "$grok_relaunch/state/grok-relaunch-task.dispatch-choice.json"
+write_grok_relaunch_meta() {  # <spawn-gen> <session> <kind>
+  cat > "$grok_relaunch/state/grok-relaunch-task.meta" <<META
+harness=grok
+kind=ship
+model=grok-4.6
+effort=xhigh
+spawn_gen=$1
+worktree=/tmp/grok-relaunch-wt
+dispatch_preset=grok-fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_runtime_session=$2
+dispatch_generation=grok-relaunch-generation
+dispatch_launch_kind=$3
+dispatch_choice_reused=1
+META
+}
+cat > "$grok_relaunch/grokhome/sessions/%2Ftmp%2Fgrok-relaunch-wt/01a0-grok-a/summary.json" <<'JSON'
+{"info":{"id":"01a0-grok-a"},"current_model_id":"grok-4.6","reasoning_effort":"xhigh"}
+JSON
+cat > "$grok_relaunch/grokhome/sessions/%2Ftmp%2Fgrok-relaunch-wt/01a0-grok-a/usage.json" <<'JSON'
+{"sessionId":"01a0-grok-a","session":{"inputTokens":100,"outputTokens":10,"cachedReadTokens":5,"cacheCreationTokens":1,"reasoningTokens":2,"modelCalls":1},"turns":[]}
+JSON
+cat > "$grok_relaunch/grokhome/sessions/%2Ftmp%2Fgrok-relaunch-wt/01a0-grok-b/summary.json" <<'JSON'
+{"info":{"id":"01a0-grok-b"},"current_model_id":"grok-4.6","reasoning_effort":"xhigh"}
+JSON
+write_grok_relaunch_meta s1 01a0-grok-a spawn
+GROK_HOME="$grok_relaunch/grokhome" FM_DATA_OVERRIDE="$grok_relaunch/data" "$METRICS" launch \
+  "$grok_relaunch/state/grok-relaunch-task.meta" "$grok_relaunch/state/grok-relaunch-task.dispatch-choice.json" || fail "Grok relaunch first launch metric failed"
+write_grok_relaunch_meta s2 01a0-grok-b relaunch
+GROK_HOME="$grok_relaunch/grokhome" FM_DATA_OVERRIDE="$grok_relaunch/data" "$METRICS" launch \
+  "$grok_relaunch/state/grok-relaunch-task.meta" "$grok_relaunch/state/grok-relaunch-task.dispatch-choice.json" || fail "Grok relaunch second launch metric failed"
+GROK_HOME="$grok_relaunch/grokhome" FM_DATA_OVERRIDE="$grok_relaunch/data" "$METRICS" finish \
+  "$grok_relaunch/state/grok-relaunch-task.meta" "$grok_relaunch/state/grok-relaunch-task.dispatch-choice.json" landed || fail "Grok relaunch finish metric failed"
+grok_relaunch_observed=$(jq -c -s 'map(select(.event=="finish"))[0] | {status: .runtime_observed.status, partial: .runtime_observed.partial, sessions: [.runtime_observed.sessions[].session_id], usage: .usage.status, reason: .usage.reason}' "$grok_relaunch/data/dispatch-metrics.jsonl")
+case "$grok_relaunch_observed" in
+  *'"status":"unknown"'*'"partial":true'*'01a0-grok-a'*'01a0-grok-b'*'"usage":"unknown"'*'no local Grok usage.json'*) ;;
+  *) fail "a partial Grok relaunch did not keep both incarnations and the precise cause: $grok_relaunch_observed" ;;
+esac
+
 # Pi records the richest local usage split in its own session JSONL files. The
 # finish event attributes them to this task by worktree path and launch window,
 # so sessions from another directory or from before the task started stay out.
@@ -430,6 +545,9 @@ worktree=$pi_dir/wt
 dispatch_preset=pi-fixed
 dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1767225600
+dispatch_generation=pi-generation
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
 META
 {
   printf '{"type":"session","version":3,"id":"pi-main","timestamp":"2026-01-01T00:00:10.000Z","cwd":"%s"}\n' "$pi_dir/wt"
@@ -445,6 +563,14 @@ META
   printf '{"type":"session","version":3,"id":"pi-old","timestamp":"2020-01-01T00:00:10.000Z","cwd":"%s"}\n' "$pi_dir/wt"
   printf '%s\n' '{"type":"message","id":"old1","parentId":null,"timestamp":"2020-01-01T00:00:12.000Z","message":{"role":"assistant","provider":"openai-codex","model":"model-pi","usage":{"input":5000,"output":5000},"stopReason":"stop"}}'
 } > "$pi_dir/piagent/sessions/--one--/2020-01-01T00-00-10-000Z_pi-old.jsonl"
+# A reused worktree slot must not pull in whatever ran immediately before this
+# generation: a session that began one tenth of a second before the recorded
+# dispatch start is already the previous occupant's, so there is deliberately
+# no pre-launch allowance around the boundary.
+{
+  printf '{"type":"session","version":3,"id":"pi-skew","timestamp":"2025-12-31T23:59:59.900Z","cwd":"%s"}\n' "$pi_dir/wt"
+  printf '%s\n' '{"type":"message","id":"skew1","parentId":null,"timestamp":"2025-12-31T23:59:59.900Z","message":{"role":"assistant","provider":"openai-codex","model":"model-pi","usage":{"input":7000,"output":7000},"stopReason":"stop"}}'
+} > "$pi_dir/piagent/sessions/--two--/2025-12-31T23-59-59-900Z_pi-skew.jsonl"
 PI_CODING_AGENT_DIR="$pi_dir/piagent" FM_DATA_OVERRIDE="$pi_dir/data" "$METRICS" launch \
   "$pi_dir/state/pi-task.meta" "$pi_dir/state/pi-task.dispatch-choice.json" || fail "Pi launch metric failed"
 PI_CODING_AGENT_DIR="$pi_dir/piagent" FM_DATA_OVERRIDE="$pi_dir/data" "$METRICS" finish \
@@ -482,6 +608,9 @@ worktree=$oc_dir/wt
 dispatch_preset=oc-fixed
 dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1767225600
+dispatch_generation=oc-generation
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
 META
 if node -e 'require("node:sqlite")' >/dev/null 2>&1; then
   cat > "$oc_dir/make-store.cjs" <<'JS'
@@ -540,10 +669,13 @@ worktree=$sessionless_dir/wt
 dispatch_preset=oc-fixed
 dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1767225600
+dispatch_generation=sessionless-generation
+dispatch_launch_kind=relaunch
+dispatch_choice_reused=1
 META
 {
-  printf '%s\n' '{"schema_version":1,"event":"launch-prepared","event_id":"launch:sessionless-task:s1","task_id":"sessionless-task","spawn_gen":"s1","started_at":"2026-01-01T00:00:00Z","effective":{"harness":"pi"}}'
-  printf '%s\n' '{"schema_version":1,"event":"launch-prepared","event_id":"launch:sessionless-task:s2","task_id":"sessionless-task","spawn_gen":"s2","started_at":"2026-01-01T00:00:00Z","effective":{"harness":"opencode"}}'
+  printf '%s\n' '{"schema_version":1,"event":"launch-prepared","event_id":"launch:sessionless-task:s1","task_id":"sessionless-task","spawn_gen":"s1","generation":"sessionless-generation","started_at":"2026-01-01T00:00:00Z","launch_kind":"spawn","selection_reused":false,"effective":{"harness":"pi"}}'
+  printf '%s\n' '{"schema_version":1,"event":"launch-prepared","event_id":"launch:sessionless-task:s2","task_id":"sessionless-task","spawn_gen":"s2","generation":"sessionless-generation","started_at":"2026-01-01T00:00:00Z","launch_kind":"relaunch","selection_reused":true,"effective":{"harness":"opencode"}}'
 } > "$sessionless_dir/data/dispatch-metrics.jsonl"
 FM_DATA_OVERRIDE="$sessionless_dir/data" "$METRICS" finish \
   "$sessionless_dir/state/sessionless-task.meta" "$sessionless_dir/state/sessionless-task.dispatch-choice.json" landed || fail "sessionless cross-harness finish failed"
@@ -589,7 +721,7 @@ printf '{"type":"assistant","effort":"medium","message":{"id":"msg_old","model":
 CLAUDE_CONFIG_DIR="$generation_dir/config" FM_DATA_OVERRIDE="$generation_dir/data" "$METRICS" finish \
   "$generation_dir/state/generation-task.meta" "$generation_dir/state/generation-task.dispatch-choice.json" landed || fail "generation finish metric failed"
 generation_observed=$(jq -c -s 'map(select(.event=="finish"))[-1] | {session: .runtime_observed.session_id, totals: .totals, input: .runtime_observed.usage.input_tokens}' "$generation_dir/data/dispatch-metrics.jsonl")
-[ "$generation_observed" = '{"session":"current-session","totals":{"launches":1,"relaunches":0,"retries":0},"input":7}' ] \
+[ "$generation_observed" = '{"session":"current-session","totals":{"status":"complete","launches":1,"relaunches":0,"retries":0},"input":7}' ] \
   || fail "a reused task id absorbed a prior generation's incarnations: $generation_observed"
 
 # The final metrics event persists explicit launch, relaunch, and retry totals
@@ -612,6 +744,7 @@ dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1
 dispatch_launch_kind=$2
 dispatch_choice_reused=$3
+dispatch_generation=totals-generation
 META
 }
 write_totals_meta s1 spawn 0
@@ -625,8 +758,58 @@ kinds=$(jq -c -s '[.[] | select(.event=="launch-prepared") | {kind: .launch_kind
   || fail "launch kinds and selection reuse were not recorded: $kinds"
 FM_DATA_OVERRIDE="$totals_dir/data" "$METRICS" finish "$totals_dir/state/totals-task.meta" "$totals_dir/state/totals-task.dispatch-choice.json" landed || fail "totals finish metric failed"
 totals_seen=$(jq -c -s 'map(select(.event=="finish"))[0].totals' "$totals_dir/data/dispatch-metrics.jsonl")
-[ "$totals_seen" = '{"launches":3,"relaunches":1,"retries":1}' ] \
+[ "$totals_seen" = '{"status":"complete","launches":3,"relaunches":1,"retries":1}' ] \
   || fail "explicit launch/relaunch/retry totals were wrong: $totals_seen"
+
+# The generation token and the explicit launch-kind/reuse fields never shipped
+# in another format, so a task or launch record missing them reports
+# incomplete evidence instead of an inferred generation, position, or reuse.
+incomplete_dir="$TMP_ROOT/incomplete-scope"
+mkdir -p "$incomplete_dir/data" "$incomplete_dir/state"
+printf '%s\n' '{"schema_version":1,"presets":{"claude-fixed":{"mode":"fixed","candidate":{"id":"opus","harness":"claude","model":"opus","effort":"medium"}}}}' > "$incomplete_dir/config.json"
+incomplete_choice=$(FM_STATE_OVERRIDE="$incomplete_dir/state" "$PRESET" select incomplete-task claude-fixed "$incomplete_dir/config.json") || fail "incomplete choice failed"
+printf '%s\n' "$incomplete_choice" > "$incomplete_dir/state/incomplete-task.dispatch-choice.json"
+cat > "$incomplete_dir/state/incomplete-task.meta" <<META
+harness=claude
+kind=ship
+model=opus
+effort=medium
+spawn_gen=s1
+dispatch_preset=claude-fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+META
+FM_DATA_OVERRIDE="$incomplete_dir/data" "$METRICS" finish "$incomplete_dir/state/incomplete-task.meta" "$incomplete_dir/state/incomplete-task.dispatch-choice.json" landed || fail "missing-generation finish metric failed"
+incomplete_seen=$(jq -c -s 'map(select(.event=="finish"))[0] | {generation, totals: .totals, runtime: {status: .runtime_observed.status, partial: .runtime_observed.partial, usage: .usage.status, reason: .usage.reason}}' "$incomplete_dir/data/dispatch-metrics.jsonl")
+case "$incomplete_seen" in
+  *'"generation":null'*'"status":"incomplete"'*'"launches":null'*'no generation token'*'"usage":"unknown"'*) ;;
+  *) fail "a missing generation was not reported as incomplete evidence: $incomplete_seen" ;;
+esac
+# A launch record without the explicit kind/reuse fields makes the totals
+# incomplete inside an otherwise scoped generation.
+kindless_dir="$TMP_ROOT/kindless"
+mkdir -p "$kindless_dir/data" "$kindless_dir/state"
+printf '%s\n' '{"schema_version":1,"presets":{"claude-fixed":{"mode":"fixed","candidate":{"id":"opus","harness":"claude","model":"opus","effort":"medium"}}}}' > "$kindless_dir/config.json"
+kindless_choice=$(FM_STATE_OVERRIDE="$kindless_dir/state" "$PRESET" select kindless-task claude-fixed "$kindless_dir/config.json") || fail "kindless choice failed"
+printf '%s\n' "$kindless_choice" > "$kindless_dir/state/kindless-task.dispatch-choice.json"
+cat > "$kindless_dir/state/kindless-task.meta" <<META
+harness=claude
+kind=ship
+model=opus
+effort=medium
+spawn_gen=s1
+dispatch_preset=claude-fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_generation=kindless-generation
+META
+FM_DATA_OVERRIDE="$kindless_dir/data" "$METRICS" launch "$kindless_dir/state/kindless-task.meta" "$kindless_dir/state/kindless-task.dispatch-choice.json" || fail "kindless launch metric failed"
+FM_DATA_OVERRIDE="$kindless_dir/data" "$METRICS" finish "$kindless_dir/state/kindless-task.meta" "$kindless_dir/state/kindless-task.dispatch-choice.json" landed || fail "kindless finish metric failed"
+kindless_seen=$(jq -c -s 'map(select(.event=="finish"))[0].totals' "$kindless_dir/data/dispatch-metrics.jsonl")
+case "$kindless_seen" in
+  *'"status":"incomplete"'*'"relaunches":null'*'"retries":null'*'without an explicit launch kind or selection reuse'*) ;;
+  *) fail "a launch record without explicit kind/reuse did not report incomplete totals: $kindless_seen" ;;
+esac
 
 # The live extension runtime observation and the local-store collector observe
 # the same incarnation, so the merge keeps the collector's completeness status,
@@ -650,6 +833,7 @@ dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1767225600
 dispatch_launch_kind=spawn
 dispatch_choice_reused=0
+dispatch_generation=merge-generation
 META
 }
 write_merge_meta s1

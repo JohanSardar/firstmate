@@ -194,6 +194,9 @@ dispatch_started_at=2026-01-01T00:00:00Z
 dispatch_started_epoch=1
 dispatch_tool_version=pi 9.9.9-old
 dispatch_runtime_session=old-pi-session
+dispatch_generation=preset-generation
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
 META
   cat > "$dir/home/state/$id.dispatch-choice.json" <<JSON
 {"schema_version":1,"task_id":"$id","preset":"synthetic-fixed","mode":"fixed","algorithm":"fixed-v1","config_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"pi-candidate","weight":null,"available":true}],"selected":{"id":"pi-candidate","harness":"pi","model":"openai-codex/model-pi","effort":"max","fast":false}}
@@ -221,6 +224,73 @@ SH
   chmod +x "$1/fakebin/opencode"
 }
 
+# install_fake_pi_for_preset_relaunch <case-dir>: the installed Pi surface a
+# preset relaunch validates - the --list-models catalog row, the provider auth
+# record, the CLI version, and the installed-package reasoning probe - so a
+# relaunch back onto the sampled pi harness can be exercised hermetically.
+install_fake_pi_for_preset_relaunch() {
+  local dir=$1 package="$1/pi-package"
+  cat > "$dir/fakebin/pi" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --help) printf '%s\n' 'Options: --tui-mode <mode>' ;;
+  --version) printf '%s\n' 'pi 9.9.9-test' ;;
+  --list-models)
+    printf '%s\n' 'provider      model       context  max-out  thinking  images'
+    printf '%s\n' 'openai-codex  model-pi    100K     10K      yes       no'
+    ;;
+esac
+SH
+  chmod +x "$dir/fakebin/pi"
+  mkdir -p "$dir/user-home/.pi/agent"
+  printf '%s\n' '{"openai-codex":{"type":"oauth"}}' > "$dir/user-home/.pi/agent/auth.json"
+  printf '%s\n' '{"providers":{"openai-codex":{"models":[{"id":"model-pi","name":"model pi","reasoning":true,"thinkingLevelMap":{"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":"max"}}]}}}' \
+    > "$dir/user-home/.pi/agent/models.json"
+  mkdir -p "$package/dist" "$package/node_modules/@earendil-works/pi-ai/dist"
+  cat > "$package/package.json" <<'JSON'
+{"name":"@earendil-works/pi-coding-agent","version":"9.9.9-test","type":"module"}
+JSON
+  cat > "$package/dist/index.js" <<'JS'
+import { readFileSync } from "node:fs";
+function loadModels(modelsPath) {
+  try {
+    const config = JSON.parse(readFileSync(modelsPath, "utf8"));
+    const models = [];
+    for (const [provider, entry] of Object.entries(config.providers ?? {})) {
+      for (const model of entry.models ?? []) models.push({ provider, ...model });
+    }
+    return models;
+  } catch {
+    return [];
+  }
+}
+export class ModelRuntime {
+  static async create({ modelsPath }) {
+    return { modelsPath, models: loadModels(modelsPath) };
+  }
+}
+export class ModelRegistry {
+  constructor(runtime) { this.runtime = runtime; }
+  async refresh() { this.runtime.models = loadModels(this.runtime.modelsPath); }
+  find(provider, id) {
+    return this.runtime.models.find((model) => model.provider === provider && model.id === id) ?? null;
+  }
+}
+JS
+  cat > "$package/node_modules/@earendil-works/pi-ai/dist/compat.js" <<'JS'
+export function getSupportedThinkingLevels(model) {
+  if (!model.reasoning) return ["off"];
+  return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) return false;
+    if (level === "xhigh" || level === "max") return mapped !== undefined;
+    return true;
+  });
+}
+JS
+  export FM_PI_PACKAGE_DIR="$package"
+}
+
 run_control() {  # <case-dir> <args...>
   local dir=$1; shift
   # A claude spawn pre-registers workspace trust in the launching user's own
@@ -229,7 +299,7 @@ run_control() {  # <case-dir> <args...>
   mkdir -p "$dir/user-home"
   env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" \
     HOME="$dir/user-home" CLAUDE_CONFIG_DIR='' \
-    FM_SPAWN_NO_GUARD=1 GROK_HOME="$dir/grokhome" \
+    FM_SPAWN_NO_GUARD=1 GROK_HOME="$dir/grokhome" FM_PI_PACKAGE_DIR="${FM_PI_PACKAGE_DIR:-}" \
     FM_CONTROL_POLL=0.01 FM_CONTROL_EXIT_WAIT=0.05 FM_CONTROL_LAUNCH_WAIT=0.05 \
     FM_REAL_GIT="${FM_REAL_GIT:-}" FM_FAKE_GIT_FAILURE="${FM_FAKE_GIT_FAILURE:-}" \
     FM_REAL_MV="${FM_REAL_MV:-}" FM_FAKE_COMPLETE_JOURNAL_MV_FAIL="${FM_FAKE_COMPLETE_JOURNAL_MV_FAIL:-}" \
@@ -1810,6 +1880,86 @@ test_relaunch_moves_a_drifted_item_back_in_flight() {
   pass "relaunch heals an item that drifted out of In flight while the task stayed live"
 }
 
+
+# A relaunch back onto the sampled harness after a foreign override must
+# reconstruct the sampled fast axis from the durable choice and discard the
+# foreign incarnation's tool version and runtime session rather than replaying
+# them as the new worker's provenance.
+test_preset_relaunch_back_to_the_sampled_harness_reconstructs_fast_and_provenance() {
+  local dir out rc id=rl-preset-back
+  dir=$(new_case preset-back "$id")
+  seed_preset_pi_task "$dir" "$id"
+  install_fake_pi_for_preset_relaunch "$dir"
+  jq '.selected.fast = true' "$dir/home/state/$id.dispatch-choice.json" > "$dir/choice.tmp"
+  mv "$dir/choice.tmp" "$dir/home/state/$id.dispatch-choice.json"
+  # The task already moved to grok once: the record carries the foreign
+  # incarnation's harness, tool version, and runtime session, and the Pi-only
+  # fast value was cleared from it.
+  sed -e 's/^harness=pi$/harness=grok/' \
+      -e 's/^dispatch_tool_version=.*$/dispatch_tool_version=grok 9.9.9-test/' \
+      -e 's/^dispatch_runtime_session=.*$/dispatch_runtime_session=foreign-grok-session/' \
+      -e '/^dispatch_fast=/d' \
+      "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.tmp"
+  mv "$dir/home/state/$id.meta.tmp" "$dir/home/state/$id.meta"
+  printf 'pi' > "$dir/fake/becomes"
+  out=$(run_control "$dir" "$id" relaunch --harness pi --note "back to the sampled tool"); rc=$?
+  expect_code 0 "$rc" "a relaunch back onto the sampled harness should succeed"$'\n'"$out"
+  [ "$(meta_field "$dir" "$id" harness)" = pi ] || fail "the record should be back on the sampled harness"
+  [ "$(meta_field "$dir" "$id" dispatch_fast)" = on ] \
+    || fail "the sampled fast axis was not reconstructed from the durable choice"
+  [ "$(meta_field "$dir" "$id" dispatch_tool_version)" = 'pi 9.9.9-test' ] \
+    || fail "the foreign tool version was not replaced by the replacement's own: '$(meta_field "$dir" "$id" dispatch_tool_version)'"
+  [ -z "$(meta_field "$dir" "$id" dispatch_runtime_session)" ] \
+    || fail "the foreign runtime session was carried into the pi replacement record"
+  assert_grep "'--no-extensions' '-e' '$dir/home/state/$id.pi-ext.ts'" "$dir/fake/literal" \
+    "the fixed-fast relaunch did not deliver the task extension as the final extension"
+  metrics="$dir/home/data/dispatch-metrics.jsonl"
+  [ "$(jq -s -r 'map(select(.event=="launch-prepared"))[-1].runtime_session' "$metrics")" = null ] \
+    || fail "the ledger attributed the foreign session to the pi incarnation"
+  [ "$(jq -s -r 'map(select(.event=="launch-prepared"))[-1].effective.tool_version' "$metrics")" = 'pi 9.9.9-test' ] \
+    || fail "the ledger attributed the foreign tool version to the pi incarnation"
+  pass "fm-control relaunch: returning to the sampled harness reconstructs the sampled fast axis and drops foreign provenance"
+}
+
+# The recorded validation basis must match what the launch actually proved:
+# an axis left to a same-vocabulary target's own default was not validated, a
+# harness outside the preset vocabulary is not validated at all, and only the
+# sampled profile's own adapter checks earn the validated basis.
+test_preset_switch_records_the_validation_basis_it_actually_proved() {
+  local dir out rc id=rl-preset-basis
+  dir=$(new_case preset-basis "$id")
+  seed_preset_pi_task "$dir" "$id"
+  install_fake_pi_for_preset_relaunch "$dir"
+  cat > "$dir/fakebin/grok" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  models) printf '%s\n' 'You are logged in with example.invalid.' '' 'Available models:' '  * grok-4.6 (default)' ;;
+  --version) printf '%s\n' 'grok 9.9.9-test' ;;
+esac
+SH
+  chmod +x "$dir/fakebin/grok"
+  printf 'grok' > "$dir/fake/becomes"
+  out=$(run_control "$dir" "$id" relaunch --harness grok --note "defaults on a known target"); rc=$?
+  expect_code 0 "$rc" "a switch onto a known target's defaults should succeed"$'\n'"$out"
+  [ "$(meta_field "$dir" "$id" dispatch_validation_basis)" = unvalidated-target-default ] \
+    || fail "default axes on a known target were labeled validated: '$(meta_field "$dir" "$id" dispatch_validation_basis)'"
+  [ "$(jq -s -r 'map(select(.event=="launch-prepared"))[-1].effective.basis' "$dir/home/data/dispatch-metrics.jsonl")" = unvalidated-target-default ] \
+    || fail "the ledger did not carry the weaker target-default basis"
+  printf 'codex' > "$dir/fake/becomes"
+  out=$(run_control "$dir" "$id" relaunch --harness codex --note "foreign target"); rc=$?
+  expect_code 0 "$rc" "a switch onto a foreign harness should succeed on that tool's defaults"$'\n'"$out"
+  [ "$(meta_field "$dir" "$id" dispatch_validation_basis)" = unvalidated-foreign-harness ] \
+    || fail "a foreign harness was labeled validated: '$(meta_field "$dir" "$id" dispatch_validation_basis)'"
+  [ "$(jq -s -r 'map(select(.event=="launch-prepared"))[-1].effective.basis' "$dir/home/data/dispatch-metrics.jsonl")" = unvalidated-foreign-harness ] \
+    || fail "the ledger did not carry the foreign-harness basis"
+  printf 'pi' > "$dir/fake/becomes"
+  out=$(run_control "$dir" "$id" relaunch --harness pi --note "sampled tool again"); rc=$?
+  expect_code 0 "$rc" "a relaunch back onto the sampled harness should validate again"$'\n'"$out"
+  [ "$(meta_field "$dir" "$id" dispatch_validation_basis)" = validated-launch-control ] \
+    || fail "the validated sampled relaunch lost its validated basis"
+  pass "fm-control relaunch: the validation basis records exactly what the launch proved"
+}
+
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_relaunch_from_linked_home_preserves_recorded_worktree
 test_relaunch_preserves_durable_task_metadata
@@ -1824,6 +1974,8 @@ test_preset_switch_to_opencode_defaults_delivers_the_ordinary_configuration
 test_preset_switch_to_opencode_defaults_refuses_before_stop_without_the_cli
 test_preset_switch_with_model_only_resolves_the_tool_default_variant
 test_preset_relaunch_refuses_an_unlaunchable_replacement_before_stop
+test_preset_relaunch_back_to_the_sampled_harness_reconstructs_fast_and_provenance
+test_preset_switch_records_the_validation_basis_it_actually_proved
 test_harness_switch_retires_a_stale_preset_runtime_observation
 test_harness_switch_resolves_a_prefixed_recorded_harness
 test_prefixed_recorded_harness_requires_explicit_replacement

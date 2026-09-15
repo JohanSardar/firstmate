@@ -9,8 +9,13 @@
 #   fm-dispatch-metrics.sh observe <task-id> [--model-used <provider/model>]
 #     [--effort-used <level>] [--fast-server-verified on|off|unknown]
 #     [--quality passed|bug-found|bug-escaped|unknown]
+#     [--defect-origin original-implementation-worker|validation-correction|pre-existing-code|unknown]
 #     [--usage '<json object with kind>'] [--basis <source>]
 #     [--quota-fraction <0..1> --monthly-price-usd <n> --reset-days <n>]
+#
+# --defect-origin attributes a recorded bug-found or bug-escaped observation to
+# a party, with --basis as its evidence. Without it a defect stays unknown; a
+# bare quality status never implies an origin.
 #
 # Records append to data/dispatch-metrics.jsonl. Subscription cost is always an
 # estimate, never billing: a weekly estimate is emitted only when all inputs are
@@ -26,7 +31,7 @@ LEDGER=$DATA/dispatch-metrics.jsonl
 NODE=${NODE:-node}
 
 usage() {
-  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 die() {

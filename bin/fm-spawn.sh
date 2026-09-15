@@ -499,6 +499,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
 # shellcheck source=bin/fm-pi-launch-plan-lib.sh
 . "$SCRIPT_DIR/fm-pi-launch-plan-lib.sh"
+# shellcheck source=bin/fm-herdr-pi-registration-lib.sh
+. "$SCRIPT_DIR/fm-herdr-pi-registration-lib.sh"
 # shellcheck source=bin/fm-grok-effort-lib.sh
 . "$SCRIPT_DIR/fm-grok-effort-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
@@ -1457,6 +1459,7 @@ DISPATCH_STARTED_AT=
 DISPATCH_STARTED_EPOCH=
 DISPATCH_RUNTIME_SESSION=
 DISPATCH_TOOL_VERSION=
+DISPATCH_VALIDATION_BASIS=
 DISPATCH_HARNESS_OVERRIDE=0
 DISPATCH_LAUNCH_KIND=
 DISPATCH_CHOICE_REUSED=0
@@ -1479,11 +1482,10 @@ if [ "$RELAUNCH" -eq 1 ]; then
     DISPATCH_TOOL_VERSION=$(fm_meta_get "$RELAUNCH_META" dispatch_tool_version)
     # Every incarnation of one preset experiment shares a generation token, so
     # the launch ledger can scope its aggregation to this task's own lifetime
-    # even if a task id is reused later. A record written before the token
-    # existed falls back to its launch origin, which is still a generation
-    # boundary on every real spawn.
+    # even if a task id is reused later. A record without one stays empty: the
+    # finish record reports incomplete evidence rather than inferring a
+    # generation from another field.
     DISPATCH_GENERATION=$(fm_meta_get "$RELAUNCH_META" dispatch_generation)
-    [ -n "$DISPATCH_GENERATION" ] || DISPATCH_GENERATION=$DISPATCH_STARTED_AT
     command -v jq >/dev/null 2>&1 || {
       echo "error: jq is required to reuse task $ID's durable preset choice" >&2
       exit 1
@@ -1510,6 +1512,33 @@ if [ "$RELAUNCH" -eq 1 ]; then
       # repopulated by the replacement's own live checks below.
       DISPATCH_TOOL_VERSION=
       DISPATCH_RUNTIME_SESSION=
+    fi
+    # The recorded tool version and runtime session describe the incarnation
+    # this launch replaces. Whenever the replacement harness differs from that
+    # incarnation - switching away from the sampled harness, or back onto it
+    # after a foreign override - both are foreign evidence and never carry into
+    # the new launch; the replacement's own checks repopulate the version, and
+    # a new session is minted below where the tool supports one.
+    if [ "$ARG3" != "$RELAUNCH_PRIOR_HARNESS" ]; then
+      DISPATCH_TOOL_VERSION=
+      DISPATCH_RUNTIME_SESSION=
+    fi
+    if [ "$ARG3" = "$DISPATCH_SELECTED_HARNESS" ]; then
+      # The durable sampled choice, not the possibly foreign-cleared task
+      # record, owns the fast axis: relaunching back onto the sampled harness
+      # reconstructs it exactly, while a switch away keeps it dropped because
+      # the fast control is Pi-only.
+      case "$ARG3" in
+        pi|pi-signed)
+          if jq -e '.selected | has("fast")' "$DISPATCH_CHOICE_PATH" >/dev/null 2>&1; then
+            if [ "$(jq -r '.selected.fast' "$DISPATCH_CHOICE_PATH")" = true ]; then
+              DISPATCH_FAST=on
+            else
+              DISPATCH_FAST=off
+            fi
+          fi
+          ;;
+      esac
     fi
   fi
 elif [ "$PRESET_SET" -eq 1 ]; then
@@ -1610,6 +1639,15 @@ dispatch_validate_live_settings() {
   # the installed tool, and a default axis must never reach a launch control.
   [ "$MODEL" != default ] && model_requested=1
   [ "$EFFORT" != default ] && effort_requested=1
+  # The recorded validation basis is exactly what this launch proved. An axis
+  # left to the target tool's own default was never validated, so a launch
+  # that requested no axis records the weaker target-default basis; the
+  # unsupported-harness branch below overrides both with its own weaker basis.
+  if [ "$model_requested" -eq 1 ] || [ "$effort_requested" -eq 1 ]; then
+    DISPATCH_VALIDATION_BASIS=validated-launch-control
+  else
+    DISPATCH_VALIDATION_BASIS=unvalidated-target-default
+  fi
   if [ -n "$DISPATCH_FAST" ] && [ "$HARNESS" != pi ] && [ "$HARNESS" != pi-signed ]; then
     echo "error: preset '$DISPATCH_PRESET' has a Pi fast setting that cannot be carried by relaunch harness '$HARNESS'" >&2
     return 1
@@ -1664,11 +1702,12 @@ dispatch_validate_live_settings() {
       fi
       if [ -n "$DISPATCH_FAST" ]; then
         # The resolved launch plan is the only fast authority: it must prove
-        # --no-extensions with this task's request-rewriting extension last, and
-        # the launch below delivers exactly this plan. A plan that cannot prove
-        # the ordering refuses before launch instead of claiming a fast value a
-        # later handler could replace.
-        if ! pi_plan_reason=$(fm_pi_fast_plan_guarantees "$STATE/$ID.pi-ext.ts" \
+        # --no-extensions with this task's request-rewriting extension last and
+        # no other extension but the verified registration-only backend
+        # integration before it, and the launch below delivers exactly this
+        # plan. A plan that cannot prove the ordering refuses before launch
+        # instead of claiming a fast value a later handler could replace.
+        if ! pi_plan_reason=$(fm_pi_fast_plan_guarantees "$STATE/$ID.pi-ext.ts" "${PI_PRESET_REGISTRATION_EXT:--}" \
             "${PI_PRESET_PLAN_ARGS[@]+"${PI_PRESET_PLAN_ARGS[@]}"}"); then
           echo "error: preset '$DISPATCH_PRESET' sets fast=$DISPATCH_FAST, but the resolved Pi launch plan cannot guarantee it ($pi_plan_reason); refusing to launch with a fast value it cannot prove" >&2
           return 1
@@ -1800,7 +1839,9 @@ dispatch_validate_live_settings() {
         # The replacement harness is outside the preset candidate vocabulary,
         # so there is no sampled profile left to validate: the switch
         # deliberately runs it on its own defaults, and the cleared provenance
-        # above records no claim about it.
+        # above records no claim about it. Nothing about its model or effort
+        # was authoritatively validated, so the weaker basis is recorded.
+        DISPATCH_VALIDATION_BASIS=unvalidated-foreign-harness
         return 0
       fi
       echo "error: preset '$DISPATCH_PRESET' selected unsupported harness '$HARNESS'" >&2
@@ -2213,18 +2254,33 @@ fi
 # Pi runs before_provider_request handlers in extension load order and the last
 # one owns the payload, so a discovered extension could replace this worker's
 # request. Only a launch that carries a fixed fast value therefore disables
-# discovery and names its required extension explicitly: the generated task
+# discovery and names its required extensions explicitly: the generated task
 # extension carries the busy-state, turn-end, and fast-request hooks and is the
-# last extension loaded. The same plan is what fm_pi_fast_plan_guarantees checks
-# below and what launch_template delivers, never two spellings of it
-# (bin/fm-pi-launch-plan-lib.sh owns the contract). A preset without a fast
-# value, and every ordinary launch, keep Pi's discovery and the prior single -e
-# shape.
+# last extension loaded, and on the herdr backend the Herdr-managed
+# registration-only integration loads before it, because --no-extensions would
+# otherwise hide the worker from Herdr's agent registry. That integration is
+# resolved and verified from the file the launch will actually load
+# (bin/fm-herdr-pi-registration-lib.sh); a missing or unverifiable file refuses
+# the launch rather than producing an unobservable worker. The same plan is
+# what fm_pi_fast_plan_guarantees checks below and what launch_template
+# delivers, never two spellings of it (bin/fm-pi-launch-plan-lib.sh owns the
+# contract). A preset without a fast value, and every ordinary launch, keep
+# Pi's discovery and the prior single -e shape.
 PI_PRESET_PLAN_ARGS=()
+PI_PRESET_REGISTRATION_EXT=
 if [ -n "$DISPATCH_PRESET" ] && [ -n "$DISPATCH_FAST" ]; then
   case "$HARNESS:$KIND" in
     pi:ship|pi:scout|pi-signed:ship|pi-signed:scout)
-      PI_PRESET_PLAN_ARGS=(--no-extensions -e "$STATE/$ID.pi-ext.ts")
+      if [ "$BACKEND" = herdr ]; then
+        pi_registration_agent_dir=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
+        if ! PI_PRESET_REGISTRATION_EXT=$(fm_herdr_pi_registration_extension "$pi_registration_agent_dir"); then
+          echo "error: preset '$DISPATCH_PRESET' sets a fixed fast value on the herdr backend, which requires the verified Herdr Pi registration integration; refusing to launch without it: $PI_PRESET_REGISTRATION_EXT" >&2
+          exit 1
+        fi
+      fi
+      PI_PRESET_PLAN_ARGS=(--no-extensions)
+      [ -z "$PI_PRESET_REGISTRATION_EXT" ] || PI_PRESET_PLAN_ARGS+=(-e "$PI_PRESET_REGISTRATION_EXT")
+      PI_PRESET_PLAN_ARGS+=(-e "$STATE/$ID.pi-ext.ts")
       ;;
   esac
 fi
@@ -4253,7 +4309,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx dispatch_preset dispatch_mode dispatch_config_sha256 dispatch_sample_sha256 dispatch_fast dispatch_started_at dispatch_started_epoch dispatch_runtime_session dispatch_tool_version dispatch_launch_kind dispatch_choice_reused dispatch_generation", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx dispatch_preset dispatch_mode dispatch_config_sha256 dispatch_sample_sha256 dispatch_fast dispatch_started_at dispatch_started_epoch dispatch_runtime_session dispatch_tool_version dispatch_validation_basis dispatch_launch_kind dispatch_choice_reused dispatch_generation", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -4283,6 +4339,7 @@ preserve_relaunch_meta() {
     echo "dispatch_started_epoch=$DISPATCH_STARTED_EPOCH"
     [ -z "$DISPATCH_RUNTIME_SESSION" ] || echo "dispatch_runtime_session=$DISPATCH_RUNTIME_SESSION"
     echo "dispatch_tool_version=$DISPATCH_TOOL_VERSION"
+    echo "dispatch_validation_basis=$DISPATCH_VALIDATION_BASIS"
     echo "dispatch_launch_kind=$DISPATCH_LAUNCH_KIND"
     echo "dispatch_choice_reused=$DISPATCH_CHOICE_REUSED"
     echo "dispatch_generation=$DISPATCH_GENERATION"

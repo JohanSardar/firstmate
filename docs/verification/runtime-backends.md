@@ -1733,6 +1733,7 @@ ok - real Pi SDK 0.85.1 resolves exact thinking levels: a mapped level passes, a
 The guard declares a local never-contacted `fm-live-fake` provider with a fully mapped model and a partially mapped model, reads no user credential, and makes no provider call.
 `tests/fm-spawn-task-model-preset.test.sh` pins the same refusal path through a full preset spawn against a fixture package and a synthetic catalog, and `tests/fm-pi-launch-plan.test.sh` owns the separate ordered-launch-plan fast guarantee.
 The preset launch delivers that plan itself when it carries a fixed fast value: `bin/fm-spawn.sh` builds `--no-extensions -e <state>/<task>.pi-ext.ts`, validates it with `bin/fm-pi-launch-plan-lib.sh`, and delivers the same args, so a fixed `fast` value is launchable and still recorded as requested-only.
+On the herdr backend the same plan also names Herdr's marked, registration-only Pi integration ahead of the task extension, because `--no-extensions` would otherwise hide the worker from Herdr's agent registry; `tests/fm-herdr-pi-registration.test.sh` owns that file's identity and registration-only proof, and `tests/fm-herdr-pi-stale-registration-live-e2e.test.sh` runs one token-free explicit-plan phase against the real Herdr and Pi to show the worker still registers.
 A preset without a fixed fast value keeps Pi's discovery and the ordinary single `-e` shape.
 
 ## Grok per-model preset reasoning efforts
