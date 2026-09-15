@@ -651,6 +651,37 @@ backlog_row_state() {
     sed -n 's/^  state: *//p' | head -1
 }
 
+# Seed the durable preset provenance a finish event needs: the task meta fields
+# the launcher records and the sampled choice file. Args: case_dir [kind]
+seed_preset_provenance() {
+  local case_dir=$1 kind=${2:-ship}
+  cat >> "$case_dir/state/task-x1.meta" <<META
+harness=pi
+model=vendor/model-fixed
+effort=high
+dispatch_preset=synthetic-fixed
+dispatch_mode=fixed
+dispatch_config_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+dispatch_fast=off
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=$(date +%s)
+dispatch_generation=teardown-generation
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
+dispatch_tool_version=pi-test
+META
+  cat > "$case_dir/state/task-x1.dispatch-choice.json" <<'JSON'
+{"schema_version":1,"task_id":"task-x1","preset":"synthetic-fixed","config_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mode":"fixed","algorithm":"fixed-v1","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"fixed","weight":null,"available":true}],"selected":{"id":"fixed","harness":"pi","model":"vendor/model-fixed","effort":"high","fast":false}}
+JSON
+}
+
+# The delivery outcome the finish event recorded. Args: case_dir
+preset_finish_outcome() {
+  local case_dir=$1
+  jq -c -s 'map(select(.event == "finish"))[-1] | {delivery_outcome, discard_authorized: .cleanup.discard_authorized}' \
+    "$case_dir/data/dispatch-metrics.jsonl"
+}
+
 # Build the teardown test's executable search path without lsof, regardless of
 # whether the host installs it in /usr/bin, /usr/sbin, or a package-manager bin.
 make_path_without_lsof() {  # <case-dir>
@@ -758,7 +789,103 @@ SH
   jq -s -e 'map(select(.event == "finish" and .delivery_outcome == "landed")) | length == 1' \
     "$case_dir/data/dispatch-metrics.jsonl" >/dev/null \
     || fail "preset metrics: retry duplicated or lost the finish outcome"
+  jq -s -e 'map(select(.event == "finish")) | length == 1 and .[0].cleanup.discard_authorized == false' \
+    "$case_dir/data/dispatch-metrics.jsonl" >/dev/null \
+    || fail "preset metrics: an ordinary landed cleanup did not record its discard authorization as false"
   pass "preset metrics finish once and retain sampled provenance until the task record closes"
+}
+
+# A forced cleanup is an authorization to skip the landed-work refusal, not
+# evidence that the work was discarded. The finish event must classify delivery
+# from the landed evidence and record the authorized local discard separately:
+# landed evidence under --force is a landed delivery whose local copy was
+# discarded, while conclusively unlanded work is a genuine discard.
+test_preset_force_landed_records_landed_with_authorized_discard() {
+  local case_dir rc
+  case_dir=$(make_case preset-force-landed)
+  write_meta "$case_dir" local-only ship
+  seed_preset_provenance "$case_dir"
+  wt_commit_file "$case_dir" feature.txt hello "landed feature"
+  # The same content already landed in origin/main, so the local copy the forced
+  # cleanup discards is a duplicate of delivered work.
+  land_on_origin_main "$case_dir" feature.txt hello
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "preset-force-landed: forced teardown should succeed"$'\n'"$(cat "$case_dir/stderr")"
+  [ "$(preset_finish_outcome "$case_dir")" = '{"delivery_outcome":"landed","discard_authorized":true}' ] \
+    || fail "preset-force-landed: landed work under --force was not recorded as landed with an authorized local discard: $(preset_finish_outcome "$case_dir")"
+  pass "a forced cleanup of landed work records a landed delivery with an authorized local discard"
+}
+
+test_preset_force_unlanded_records_discarded() {
+  local case_dir rc
+  case_dir=$(make_case preset-force-unlanded)
+  write_meta "$case_dir" local-only ship
+  seed_preset_provenance "$case_dir"
+  # Content that is on no remote, has no PR, and is not in origin/main: both
+  # landing proofs answer conclusively, so the forced cleanup discarded
+  # genuinely unlanded work.
+  wt_commit_file "$case_dir" feature.txt hello "unlanded feature"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "preset-force-unlanded: forced teardown should succeed"$'\n'"$(cat "$case_dir/stderr")"
+  [ "$(preset_finish_outcome "$case_dir")" = '{"delivery_outcome":"discarded","discard_authorized":true}' ] \
+    || fail "preset-force-unlanded: conclusively unlanded work was not recorded as discarded: $(preset_finish_outcome "$case_dir")"
+  pass "a forced cleanup of conclusively unlanded work records a discarded delivery"
+}
+
+test_preset_force_unprovable_records_unknown() {
+  local case_dir rc
+  case_dir=$(make_case preset-force-unknown)
+  write_meta "$case_dir" local-only ship
+  seed_preset_provenance "$case_dir"
+  wt_commit_file "$case_dir" feature.txt hello "feature with no provable PR"
+  # A failed PR lookup makes the merged-PR proof inconclusive while the content
+  # proof is a conclusive negative: delivery can be neither confirmed nor
+  # denied, so the finish event must keep it explicitly unknown rather than
+  # defaulting the forced cleanup to discarded.
+  cat > "$case_dir/fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$case_dir/fakebin/gh-axi"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "preset-force-unknown: forced teardown should succeed"$'\n'"$(cat "$case_dir/stderr")"
+  [ "$(preset_finish_outcome "$case_dir")" = '{"delivery_outcome":"unknown","discard_authorized":true}' ] \
+    || fail "preset-force-unknown: unprovable delivery under --force was not kept unknown: $(preset_finish_outcome "$case_dir")"
+  pass "a forced cleanup with unprovable delivery evidence records unknown rather than discarded"
+}
+
+test_preset_force_scout_with_report_records_report_complete() {
+  local case_dir rc
+  case_dir=$(make_case preset-force-scout-report)
+  write_meta "$case_dir" local-only scout
+  seed_preset_provenance "$case_dir" scout
+  mkdir -p "$case_dir/data/task-x1"
+  printf '%s\n' 'scout findings' > "$case_dir/data/task-x1/report.md"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "preset-force-scout-report: forced scout teardown should succeed"$'\n'"$(cat "$case_dir/stderr")"
+  [ "$(preset_finish_outcome "$case_dir")" = '{"delivery_outcome":"report-complete","discard_authorized":true}' ] \
+    || fail "preset-force-scout-report: a delivered scout report was not recorded as report-complete: $(preset_finish_outcome "$case_dir")"
+  pass "a forced scout cleanup with a delivered report records report-complete"
 }
 
 # A pending-close record is what a later startup replay trusts to close the
@@ -3784,6 +3911,10 @@ EOF
 test_local_only_fork_remote_allows
 test_preset_metrics_finish_waits_for_task_record_close
 test_preset_finish_is_durable_before_the_pending_close_record
+test_preset_force_landed_records_landed_with_authorized_discard
+test_preset_force_unlanded_records_discarded
+test_preset_force_unprovable_records_unknown
+test_preset_force_scout_with_report_records_report_complete
 test_teardown_closes_the_backlog_item_itself
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator
 test_local_only_truly_unpushed_refuses

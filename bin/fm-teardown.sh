@@ -1245,12 +1245,14 @@ remove_pr_poll_artifacts() {
 }
 
 # Resolve the PR number for a worktree branch via gh-axi. Echoes the number on a
-# single match and returns 0; returns non-zero on no match or any lookup failure,
-# so the caller treats it as "no PR found" (fail-safe).
+# single match and returns 0. A completed lookup with no matching row returns 1
+# (a conclusive "this branch has no PR"), while an unusable branch or a failed
+# lookup command returns 2, so a caller that needs delivery evidence can tell a
+# conclusive negative from evidence it could not gather at all.
 pr_number_from_branch() {
   local branch=$1 out n
-  [ -n "$branch" ] && [ "$branch" != HEAD ] || return 1
-  out=$( cd "$WT" && gh-axi pr list --state all --head "$branch" --limit 1 2>/dev/null ) || return 1
+  [ -n "$branch" ] && [ "$branch" != HEAD ] || return 2
+  out=$( cd "$WT" && gh-axi pr list --state all --head "$branch" --limit 1 2>/dev/null ) || return 2
   n=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\),.*/\1/p' | head -1)
   [ -n "$n" ] || return 1
   printf '%s' "$n"
@@ -1316,31 +1318,39 @@ EOF
 
 # Is the worktree's PR merged for local work contained in that PR? Resolves the
 # PR from the recorded pr= URL first, then from the branch name, and asks GitHub
-# for both the PR state and head. Returns non-zero when the PR is not merged, the
-# current work is not contained in the PR head, no PR is found, or any gh error
-# occurs - the caller then falls back to the content check.
+# for both the PR state and head. Returns 0 when a merged PR proves containment,
+# 1 when the evidence is present and conclusive that the work is not contained in
+# a merged PR (no PR answers for the branch, the PR is not merged, or the current
+# work is not in its head), and 2 when the evidence could not be gathered (failed
+# lookup, missing object, unreadable HEAD). The caller falls back to the content
+# check on any non-zero, and delivery classification keeps 2 distinct from 1.
 pr_is_merged() {
-  local branch=$1 target view state remainder head resolved_url current landed=0
+  local branch=$1 target view state remainder head resolved_url current landed=0 rc
   if [ -n "$PR_URL" ]; then
     target=$PR_URL
   else
-    target=$(pr_number_from_branch "$branch") || return 1
+    if target=$(pr_number_from_branch "$branch"); then
+      :
+    else
+      rc=$?
+      return "$rc"
+    fi
   fi
-  [ -n "$target" ] || return 1
-  view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid,url -q '.state + "\t" + .headRefOid + "\t" + .url' 2>/dev/null) || return 1
+  [ -n "$target" ] || return 2
+  view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid,url -q '.state + "\t" + .headRefOid + "\t" + .url' 2>/dev/null) || return 2
   state=${view%%$'\t'*}
   remainder=${view#*$'\t'}
-  [ "$state" != "$view" ] || return 1
+  [ "$state" != "$view" ] || return 2
   head=${remainder%%$'\t'*}
   resolved_url=${remainder#*$'\t'}
-  [ "$head" != "$remainder" ] || return 1
+  [ "$head" != "$remainder" ] || return 2
   case "$state" in
     MERGED|merged) ;;
     *) return 1 ;;
   esac
-  [ -n "$head" ] || return 1
-  ensure_commit_object "$target" "$head" || return 1
-  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
+  [ -n "$head" ] || return 2
+  ensure_commit_object "$target" "$head" || return 2
+  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 2
   if git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null; then
     landed=1
   elif unpushed_patches_are_in_pr_head "$head"; then
@@ -1348,7 +1358,7 @@ pr_is_merged() {
   fi
   [ "$landed" = 1 ] || return 1
   if [ -z "$PR_URL" ]; then
-    [ -n "$resolved_url" ] || return 1
+    [ -n "$resolved_url" ] || return 2
     PR_URL=$resolved_url
   fi
   return 0
@@ -1359,35 +1369,105 @@ pr_is_merged() {
 # the default branch does not already contain (e.g. its change landed via squash) the
 # merged tree equals the default branch's tree. This isolates branch-only changes, so
 # unrelated commits the default branch gained past the merge-base do not count as
-# "added". Returns non-zero when inconclusive (no default ref, or a merge conflict),
-# so the caller refuses rather than guesses.
+# "added". Returns 1 when the answer is conclusive that the content is NOT in the
+# default branch, and 2 when the check could not complete (no default ref, failed
+# fetch, or a merge conflict), so evidence-gathering callers can keep unknown
+# distinct from a real negative while the safety gate still refuses on both.
 content_in_default() {
   local name ref default_tree merged_tree
-  name=$(default_branch) || return 1
+  name=$(default_branch) || return 2
   if git -C "$WT" remote get-url origin >/dev/null 2>&1; then
-    git -C "$WT" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 || return 1
+    git -C "$WT" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 || return 2
     ref="refs/remotes/origin/$name"
   elif git -C "$WT" rev-parse --quiet --verify "refs/heads/$name" >/dev/null 2>&1; then
     ref="refs/heads/$name"
   else
-    return 1
+    return 2
   fi
-  default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
-  [ -n "$default_tree" ] || return 1
-  merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
+  default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 2
+  [ -n "$default_tree" ] || return 2
+  merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 2
   merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
   [ "$merged_tree" = "$default_tree" ]
+}
+
+# Landing evidence for the current worktree, three-valued so a caller that needs
+# delivery evidence can tell a conclusive "not landed" from evidence it could not
+# gather. The verdict is published in the WORK_LANDING_EVIDENCE global rather
+# than captured from stdout, because gathering it must run in the calling shell:
+# discovering a merged PR sets PR_URL for the later backlog close, and a command
+# substitution would keep that side effect in a subshell. landed means one proof
+# held; unlanded means both proofs ran and conclusively found nothing landed;
+# unknown means at least one proof could not complete, and delivery must then
+# stay unknown rather than be guessed.
+WORK_LANDING_EVIDENCE=
+work_landing_evidence() {
+  local branch=$1 pr_rc content_rc
+  WORK_LANDING_EVIDENCE=
+  if pr_is_merged "$branch"; then
+    WORK_LANDING_EVIDENCE=landed
+    return 0
+  else
+    pr_rc=$?
+  fi
+  if content_in_default; then
+    WORK_LANDING_EVIDENCE=landed
+    return 0
+  else
+    content_rc=$?
+  fi
+  if [ "$pr_rc" -eq 1 ] && [ "$content_rc" -eq 1 ]; then
+    WORK_LANDING_EVIDENCE=unlanded
+  else
+    WORK_LANDING_EVIDENCE=unknown
+  fi
+  return 0
 }
 
 # Has the worktree's committed work actually LANDED, though its commits are not
 # reachable from any remote-tracking branch? True when a merged PR proves the
 # current local work is contained in the PR head, OR the content is already in the
-# default branch (fallback, which also covers the no-PR and gh-error paths). False
-# only for genuinely unlanded work.
+# default branch (fallback, which also covers the no-PR path). False for both
+# genuinely unlanded work and unprovable evidence, so the safety gate refuses
+# either way; callers that must distinguish those cases read the
+# WORK_LANDING_EVIDENCE global instead.
 work_is_landed() {
-  local branch=$1
-  pr_is_merged "$branch" && return 0
-  content_in_default
+  work_landing_evidence "$1"
+  [ "$WORK_LANDING_EVIDENCE" = landed ]
+}
+
+# The delivery outcome recorded for a preset task at cleanup, published in the
+# DISPATCH_OUTCOME global (never stdout, for the same in-shell evidence reason).
+# The ordinary path has already proved landed work for a ship and a delivered
+# report for a scout, so those outcomes are direct. --force only authorizes
+# skipping those refusals; it is not evidence that the work was discarded, so a
+# forced cleanup classifies delivery from the same landed evidence: landed when a
+# proof held (the local copy was then discarded under explicit authorization),
+# discarded only when both proofs conclusively found no landing and the cleanup
+# is discarding real unlanded work, and unknown when no proof was reachable at
+# all.
+DISPATCH_OUTCOME=
+preset_delivery_outcome() {
+  local branch
+  if [ "$KIND" = scout ]; then
+    if [ -f "$DATA/$ID/report.md" ]; then DISPATCH_OUTCOME=report-complete; else DISPATCH_OUTCOME=discarded; fi
+    return 0
+  fi
+  if [ "$FORCE" != "--force" ]; then
+    DISPATCH_OUTCOME=landed
+    return 0
+  fi
+  if ! teardown_owns_worktree || [ ! -d "$WT" ] || ! inspectable_git_worktree "$WT"; then
+    DISPATCH_OUTCOME=unknown
+    return 0
+  fi
+  branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=
+  work_landing_evidence "$branch"
+  case "$WORK_LANDING_EVIDENCE" in
+    landed) DISPATCH_OUTCOME=landed ;;
+    unlanded) DISPATCH_OUTCOME=discarded ;;
+    *) DISPATCH_OUTCOME=unknown ;;
+  esac
 }
 
 # The completion links this teardown already holds locally. A scout's
@@ -3219,15 +3299,21 @@ if [ -n "$DISPATCH_PRESET" ]; then
     echo "error: task $ID records preset '$DISPATCH_PRESET' but its sampled choice is missing; retaining the task record rather than losing comparison provenance" >&2
     exit 1
   }
+  # The delivery outcome is classified from landed evidence rather than from
+  # --force itself: forcing only raises the refusal, it is not proof the work
+  # was discarded. Whether the local copy was discarded under that explicit
+  # authorization is recorded separately, so a landed delivery whose local
+  # copy was discarded is distinguishable from genuinely unlanded work and
+  # from an unprovable delivery.
+  DISPATCH_OUTCOME=
+  preset_delivery_outcome
   if [ "$FORCE" = --force ]; then
-    DISPATCH_OUTCOME=discarded
-  elif [ "$KIND" = scout ]; then
-    DISPATCH_OUTCOME=report-complete
+    DISPATCH_DISCARD_AUTHORIZED=true
   else
-    DISPATCH_OUTCOME=landed
+    DISPATCH_DISCARD_AUTHORIZED=false
   fi
   if ! FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
-      "$SCRIPT_DIR/fm-dispatch-metrics.sh" finish "$META" "$DISPATCH_CHOICE" "$DISPATCH_OUTCOME"; then
+      "$SCRIPT_DIR/fm-dispatch-metrics.sh" finish "$META" "$DISPATCH_CHOICE" "$DISPATCH_OUTCOME" "$DISPATCH_DISCARD_AUTHORIZED"; then
     echo "error: task $ID's preset metrics could not be finalized; retaining every durable record rather than recording a pending close with no finish event" >&2
     exit 1
   fi

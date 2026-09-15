@@ -178,6 +178,11 @@ FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --model-used
 [ "$(jq -s -r 'map(select(.event=="observation"))[0].cost.weekly_usd' "$ledger")" = 2 ] || fail "weekly estimate formula is wrong"
 [ "$(jq -s -r 'map(select(.event=="observation"))[0].quality.defect_origin' "$ledger")" = unknown ] || fail "a bare bug-found status implied a defect origin"
 [ "$(jq -s -r 'map(select(.event=="observation"))[0].quality.defect_origin_explicit' "$ledger")" = false ] || fail "an unsupplied defect origin was recorded as explicit"
+# The observation is stamped with the task generation so a later finish event
+# can scope the evidence to its own task lifetime; with no explicit
+# --generation the ledger's latest launch-prepared record supplies it.
+[ "$(jq -s -r 'map(select(.event=="observation"))[0].generation' "$ledger")" = metric-generation ] || fail "an observation was not stamped with the task generation"
+[ "$(jq -s -r 'map(select(.event=="observation"))[0].generation_basis' "$ledger")" = latest-recorded-launch ] || fail "the derived generation basis was not recorded"
 FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --quota-fraction 0.1 --monthly-price-usd 80 --reset-days 30 || fail "monthly-period observation failed"
 [ "$(jq -s -r 'map(select(.event=="observation"))[1].cost.status' "$ledger")" = unknown ] || fail "incompatible reset period was presented as weekly cost"
 
@@ -202,17 +207,96 @@ FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --quality bu
 sed 's/^spawn_gen=s1$/spawn_gen=s2/' "$metrics_dir/state/metric-task.meta" > "$metrics_dir/state/metric-task.meta.tmp"
 mv "$metrics_dir/state/metric-task.meta.tmp" "$metrics_dir/state/metric-task.meta"
 FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" finish "$metrics_dir/state/metric-task.meta" "$metrics_dir/state/metric-task.dispatch-choice.json" landed || fail "defect attribution finish failed"
-[ "$(jq -s -r 'map(select(.event=="finish"))[1].quality.defect_attribution.origin' "$ledger")" = original-implementation-worker ] || fail "a single explicit defect origin was not attributed"
+# The bare bug-found observation above recorded no origin, so the task-level
+# attribution must stay unknown even though another defect carries a known
+# origin: one defect without a proven cause makes the mixed claim unprovable,
+# and the basis names the evidence instead of silently dropping it.
+[ "$(jq -s -r 'map(select(.event=="finish"))[1].quality.defect_attribution.origin' "$ledger")" = unknown ] || fail "an implicit unknown-origin defect was hidden behind a known origin"
 [ "$(jq -s -r 'map(select(.event=="finish"))[1].quality.defect_attribution.evidence | length' "$ledger")" -eq 2 ] || fail "every recorded observation was not kept as evidence"
-# An explicitly unattributed defect blocks a task-level origin even when other
-# defects were attributed, because one recorded defect without a proven cause
-# makes the task-level claim unprovable.
+[ "$(jq -s -r 'map(select(.event=="finish"))[1].quality.defect_attribution.basis | test("no proven origin")' "$ledger")" = true ] || fail "the mixed-attribution basis did not explain the unknown component"
+# An explicitly unattributed defect keeps the same conservative result.
 FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe metric-task --quality bug-escaped --defect-origin unknown --basis "the failing change could not be isolated" || fail "explicit unknown defect-origin observation failed"
 sed 's/^spawn_gen=s2$/spawn_gen=s3/' "$metrics_dir/state/metric-task.meta" > "$metrics_dir/state/metric-task.meta.tmp"
 mv "$metrics_dir/state/metric-task.meta.tmp" "$metrics_dir/state/metric-task.meta"
 FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" finish "$metrics_dir/state/metric-task.meta" "$metrics_dir/state/metric-task.dispatch-choice.json" landed || fail "mixed defect attribution finish failed"
 [ "$(jq -s -r 'map(select(.event=="finish"))[2].quality.defect_attribution.origin' "$ledger")" = unknown ] || fail "an explicitly unattributed defect was hidden behind another origin"
-[ "$(jq -s -r 'map(select(.event=="finish"))[2].quality.defect_attribution.basis' "$ledger")" = "at least one recorded defect was explicitly left without a proven origin" ] || fail "the mixed-attribution reason was not recorded"
+[ "$(jq -s -r 'map(select(.event=="finish"))[2].quality.defect_attribution.basis | test("no proven origin")' "$ledger")" = true ] || fail "the explicitly unknown-attribution reason was not recorded"
+
+# A generation whose recorded defects all carry exactly one known origin is the
+# only case where the finish event may name that origin. A defect observation
+# from another generation, or one carrying no generation token, is preserved as
+# unscoped evidence and can never be inherited by this lifetime.
+scoped_choice=$(FM_STATE_OVERRIDE="$metrics_dir/state" "$PRESET" select scoped-defect-task fixed-example "$metrics_dir/config.json") || fail "scoped defect choice failed"
+printf '%s\n' "$scoped_choice" > "$metrics_dir/state/scoped-defect-task.dispatch-choice.json"
+cat > "$metrics_dir/state/scoped-defect-task.meta" <<'META'
+harness=pi
+kind=ship
+model=vendor/model-fixed
+effort=high
+spawn_gen=sd1
+dispatch_preset=fixed-example
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_generation=scoped-generation
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
+META
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" launch "$metrics_dir/state/scoped-defect-task.meta" "$metrics_dir/state/scoped-defect-task.dispatch-choice.json" || fail "scoped defect launch failed"
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe scoped-defect-task --quality bug-found --defect-origin validation-correction --basis "the validation fix introduced it" || fail "scoped defect observation failed"
+scoped_event=$(jq -s -r 'map(select(.event=="observation" and .task_id=="scoped-defect-task"))[0].event_id' "$ledger")
+scoped_stamp=$(jq -s -r 'map(select(.event=="observation" and .task_id=="scoped-defect-task"))[0].generation' "$ledger")
+[ "$scoped_stamp" = scoped-generation ] || fail "the scoped observation did not inherit the current generation ($scoped_stamp)"
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" finish "$metrics_dir/state/scoped-defect-task.meta" "$metrics_dir/state/scoped-defect-task.dispatch-choice.json" landed || fail "scoped defect finish failed"
+scoped_origin=$(jq -s -r 'map(select(.event=="finish" and .task_id=="scoped-defect-task"))[0].quality.defect_attribution.origin' "$ledger")
+[ "$scoped_origin" = validation-correction ] || fail "a single agreed known defect origin was not attributed ($scoped_origin)"
+# Reusing the task id for a new lifetime must not inherit the previous
+# generation's attributed defect or a legacy observation that carries no
+# generation token; both stay visible as unscoped evidence.
+printf '%s\n' \
+  '{"event":"observation","event_id":"obs-legacy-defect","task_id":"scoped-defect-task","quality":{"status":"bug-found","defect_origin":"pre-existing-code","defect_origin_explicit":true}}' \
+  >> "$ledger"
+printf '%s\n' \
+  '{"event":"observation","event_id":"obs-foreign-generation","task_id":"scoped-defect-task","generation":"other-generation","quality":{"status":"bug-found","defect_origin":"original-implementation-worker"}}' \
+  >> "$ledger"
+scoped_choice2=$(FM_STATE_OVERRIDE="$metrics_dir/state" "$PRESET" select scoped-defect-task fixed-example "$metrics_dir/config.json") || fail "second scoped choice failed"
+printf '%s\n' "$scoped_choice2" > "$metrics_dir/state/scoped-defect-task.dispatch-choice.json"
+sed 's/^dispatch_generation=scoped-generation$/dispatch_generation=second-generation/; s/^spawn_gen=sd1$/spawn_gen=sd2/' \
+  "$metrics_dir/state/scoped-defect-task.meta" > "$metrics_dir/state/scoped-defect-task.meta.tmp"
+mv "$metrics_dir/state/scoped-defect-task.meta.tmp" "$metrics_dir/state/scoped-defect-task.meta"
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" launch "$metrics_dir/state/scoped-defect-task.meta" "$metrics_dir/state/scoped-defect-task.dispatch-choice.json" || fail "second scoped launch failed"
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" finish "$metrics_dir/state/scoped-defect-task.meta" "$metrics_dir/state/scoped-defect-task.dispatch-choice.json" landed || fail "second scoped finish failed"
+scoped_reuse_origin=$(jq -s -r 'map(select(.event=="finish" and .task_id=="scoped-defect-task"))[1].quality.defect_attribution.origin' "$ledger")
+scoped_reuse_evidence=$(jq -s -r 'map(select(.event=="finish" and .task_id=="scoped-defect-task"))[1].quality.defect_attribution.evidence | length' "$ledger")
+scoped_reuse_unscoped=$(jq -s -r 'map(select(.event=="finish" and .task_id=="scoped-defect-task"))[1].quality.defect_attribution.unscoped_evidence | length' "$ledger")
+scoped_reuse_scoped=$(jq -s -r --arg id "$scoped_event" 'map(select(.event=="finish" and .task_id=="scoped-defect-task"))[1].quality.defect_attribution.unscoped_evidence | map(select(.event_id==$id)) | length' "$ledger")
+scoped_reuse_basis=$(jq -s -r 'map(select(.event=="finish" and .task_id=="scoped-defect-task"))[1].quality.defect_attribution.basis' "$ledger")
+[ "$scoped_reuse_origin" = unknown ] || fail "a reused task id inherited a prior generation's defect origin"
+[ "$scoped_reuse_evidence" -eq 0 ] || fail "a reused task id inherited prior-generation defect evidence"
+[ "$scoped_reuse_unscoped" -eq 3 ] || fail "the unscoped defect observations were not preserved as evidence"
+[ "$scoped_reuse_scoped" -eq 1 ] || fail "the previous generation's observation was not listed as unscoped evidence"
+assert_contains "$scoped_reuse_basis" "3 defect observation(s) from another generation or without a generation token were not inherited" "unscoped defect evidence basis"
+# An explicit --generation wins over the ledger's latest launch and records its
+# own basis, so an operator appending an observation for a known lifetime is
+# never silently restamped with a newer one.
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" observe scoped-defect-task --generation pinned-generation --quality bug-found --defect-origin pre-existing-code || fail "explicit-generation observation failed"
+pinned_stamp=$(jq -s -r 'map(select(.event=="observation" and .task_id=="scoped-defect-task"))[-1] | .generation + ":" + .generation_basis' "$ledger")
+[ "$pinned_stamp" = "pinned-generation:explicit" ] || fail "an explicit generation was not honored ($pinned_stamp)"
+
+# The finish command records whether the cleanup discarded the local copy under
+# explicit authorization, as a separate axis from the delivery outcome: a
+# delivery classified landed (or unknown) is not turned into a discard claim,
+# and a value that is neither true nor false is refused.
+sed 's/^spawn_gen=s3$/spawn_gen=s4/' "$metrics_dir/state/metric-task.meta" > "$metrics_dir/state/metric-task.meta.tmp"
+mv "$metrics_dir/state/metric-task.meta.tmp" "$metrics_dir/state/metric-task.meta"
+FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" finish "$metrics_dir/state/metric-task.meta" "$metrics_dir/state/metric-task.dispatch-choice.json" unknown true || fail "discard-authorized finish failed"
+[ "$(jq -s -r 'map(select(.event=="finish" and .task_id=="metric-task"))[3].cleanup.discard_authorized' "$ledger")" = true ] || fail "the authorized local discard was not recorded"
+[ "$(jq -s -r 'map(select(.event=="finish" and .task_id=="metric-task"))[3].delivery_outcome' "$ledger")" = unknown ] || fail "the authorized discard replaced the classified delivery outcome"
+set +e
+discard_bad=$(FM_DATA_OVERRIDE="$metrics_dir/data" "$METRICS" finish "$metrics_dir/state/metric-task.meta" "$metrics_dir/state/metric-task.dispatch-choice.json" landed maybe 2>&1)
+discard_bad_rc=$?
+set -e
+[ "$discard_bad_rc" -eq 2 ] || fail "an invalid discard-authorized value was accepted"
+assert_contains "$discard_bad" "discard-authorized" "discard-authorized usage refusal"
 
 # A quality observation that records no defect is never attribution evidence:
 # a passed result or a generic unknown quality must neither add defect evidence
@@ -242,13 +326,13 @@ printf '%s\n' "$defect_choice" > "$defect_scope_dir/state/mixed-defect-task.disp
 write_defect_scope_meta mixed-defect-task s1
 scope_ledger="$defect_scope_dir/data/dispatch-metrics.jsonl"
 printf '%s\n' \
-  '{"event":"observation","event_id":"obs-passed","task_id":"mixed-defect-task","quality":{"status":"passed","basis":"tests passed","defect_origin":"unknown","defect_origin_explicit":false,"defect_origin_basis":"no defect origin evidence was supplied with this observation"}}' \
-  '{"event":"observation","event_id":"obs-unknown","task_id":"mixed-defect-task","quality":{"status":"unknown","basis":"quality not assessed","defect_origin":"unknown","defect_origin_explicit":true,"defect_origin_basis":"operator left the call open"}}' \
-  '{"event":"observation","event_id":"obs-bug","task_id":"mixed-defect-task","quality":{"status":"bug-found","basis":"reproduced defect","defect_origin":"validation-correction","defect_origin_explicit":true,"defect_origin_basis":"the validation fix introduced it"}}' \
+  '{"event":"observation","event_id":"obs-passed","task_id":"mixed-defect-task","generation":"defect-scope-generation","quality":{"status":"passed","basis":"tests passed","defect_origin":"unknown","defect_origin_explicit":false,"defect_origin_basis":"no defect origin evidence was supplied with this observation"}}' \
+  '{"event":"observation","event_id":"obs-unknown","task_id":"mixed-defect-task","generation":"defect-scope-generation","quality":{"status":"unknown","basis":"quality not assessed","defect_origin":"unknown","defect_origin_explicit":true,"defect_origin_basis":"operator left the call open"}}' \
+  '{"event":"observation","event_id":"obs-bug","task_id":"mixed-defect-task","generation":"defect-scope-generation","quality":{"status":"bug-found","basis":"reproduced defect","defect_origin":"validation-correction","defect_origin_explicit":true,"defect_origin_basis":"the validation fix introduced it"}}' \
   >> "$scope_ledger"
 FM_DATA_OVERRIDE="$defect_scope_dir/data" "$METRICS" finish "$defect_scope_dir/state/mixed-defect-task.meta" "$defect_scope_dir/state/mixed-defect-task.dispatch-choice.json" landed || fail "mixed defect-scope finish failed"
 mixed_scope=$(jq -c -s 'map(select(.event=="finish" and .task_id=="mixed-defect-task"))[0].quality.defect_attribution | {origin, evidence: [.evidence[].event_id], basis}' "$scope_ledger")
-[ "$mixed_scope" = '{"origin":"validation-correction","evidence":["obs-bug"],"basis":"recorded by explicit defect-origin observation(s) obs-bug"}' ] \
+[ "$mixed_scope" = '{"origin":"validation-correction","evidence":["obs-bug"],"basis":"recorded by defect-origin observation(s) obs-bug"}' ] \
   || fail "non-defect observations polluted defect attribution: $mixed_scope"
 
 # With no defect observation at all, passed and unknown records create no
@@ -258,13 +342,55 @@ passed_choice=$(FM_STATE_OVERRIDE="$defect_scope_dir/state" "$PRESET" select pas
 printf '%s\n' "$passed_choice" > "$defect_scope_dir/state/passed-only-task.dispatch-choice.json"
 write_defect_scope_meta passed-only-task s2
 printf '%s\n' \
-  '{"event":"observation","event_id":"obs-passed-only","task_id":"passed-only-task","quality":{"status":"passed","basis":"tests passed","defect_origin":"unknown","defect_origin_explicit":false,"defect_origin_basis":"no defect origin evidence was supplied with this observation"}}' \
-  '{"event":"observation","event_id":"obs-unknown-only","task_id":"passed-only-task","quality":{"status":"unknown","basis":"quality not assessed","defect_origin":"unknown","defect_origin_explicit":true,"defect_origin_basis":"operator left the call open"}}' \
+  '{"event":"observation","event_id":"obs-passed-only","task_id":"passed-only-task","generation":"defect-scope-generation","quality":{"status":"passed","basis":"tests passed","defect_origin":"unknown","defect_origin_explicit":false,"defect_origin_basis":"no defect origin evidence was supplied with this observation"}}' \
+  '{"event":"observation","event_id":"obs-unknown-only","task_id":"passed-only-task","generation":"defect-scope-generation","quality":{"status":"unknown","basis":"quality not assessed","defect_origin":"unknown","defect_origin_explicit":true,"defect_origin_basis":"operator left the call open"}}' \
   >> "$scope_ledger"
 FM_DATA_OVERRIDE="$defect_scope_dir/data" "$METRICS" finish "$defect_scope_dir/state/passed-only-task.meta" "$defect_scope_dir/state/passed-only-task.dispatch-choice.json" landed || fail "passed-only defect-scope finish failed"
 passed_scope=$(jq -c -s 'map(select(.event=="finish" and .task_id=="passed-only-task"))[0].quality.defect_attribution | {origin, evidence: (.evidence | length), basis}' "$scope_ledger")
-[ "$passed_scope" = '{"origin":"unknown","evidence":0,"basis":"no defect origin was observed for this task"}' ] \
+[ "$passed_scope" = '{"origin":"unknown","evidence":0,"basis":"no defect origin was observed for this task generation"}' ] \
   || fail "non-defect observations created an unknown-defect attribution: $passed_scope"
+
+# A defect observation whose origin field is absent entirely (a legacy or
+# foreign producer record) is still an actual defect: it is preserved in
+# evidence with an explicit null origin_recorded, and it conservatively blocks
+# a more specific attribution even though a known-origin record exists.
+absent_choice=$(FM_STATE_OVERRIDE="$defect_scope_dir/state" "$PRESET" select absent-origin-task fixed "$defect_scope_dir/config.json") || fail "absent-origin defect-scope choice failed"
+printf '%s\n' "$absent_choice" > "$defect_scope_dir/state/absent-origin-task.dispatch-choice.json"
+write_defect_scope_meta absent-origin-task s3
+printf '%s\n' \
+  '{"event":"observation","event_id":"obs-absent-origin","task_id":"absent-origin-task","generation":"defect-scope-generation","quality":{"status":"bug-found","basis":"reproduced defect with no recorded cause"}}' \
+  '{"event":"observation","event_id":"obs-known-later","task_id":"absent-origin-task","generation":"defect-scope-generation","quality":{"status":"bug-found","basis":"reproduced defect","defect_origin":"validation-correction","defect_origin_explicit":true,"defect_origin_basis":"the validation fix introduced it"}}' \
+  >> "$scope_ledger"
+FM_DATA_OVERRIDE="$defect_scope_dir/data" "$METRICS" finish "$defect_scope_dir/state/absent-origin-task.meta" "$defect_scope_dir/state/absent-origin-task.dispatch-choice.json" landed || fail "absent-origin defect-scope finish failed"
+absent_scope=$(jq -c -s 'map(select(.event=="finish" and .task_id=="absent-origin-task"))[0].quality.defect_attribution | {origin, evidence: [.evidence[] | {id: .event_id, origin, recorded: .origin_recorded}], basis}' "$scope_ledger")
+[ "$absent_scope" = '{"origin":"unknown","evidence":[{"id":"obs-absent-origin","origin":"unknown","recorded":null},{"id":"obs-known-later","origin":"validation-correction","recorded":"validation-correction"}],"basis":"at least one recorded defect had no proven origin (obs-absent-origin)"}' ] \
+  || fail "an absent defect origin did not conservatively block attribution: $absent_scope"
+
+# A finish record with no generation token (a legacy record written before
+# generation stamping) cannot scope any observation to its lifetime, so it must
+# not attribute a defect: the recorded defects stay listed as unscoped evidence
+# with the reason rather than being dropped or silently inherited.
+legacy_choice=$(FM_STATE_OVERRIDE="$defect_scope_dir/state" "$PRESET" select legacy-finish-task fixed "$defect_scope_dir/config.json") || fail "legacy-finish defect-scope choice failed"
+printf '%s\n' "$legacy_choice" > "$defect_scope_dir/state/legacy-finish-task.dispatch-choice.json"
+cat > "$defect_scope_dir/state/legacy-finish-task.meta" <<'META'
+harness=pi
+kind=ship
+model=openai-codex/model
+effort=high
+spawn_gen=s4
+dispatch_preset=fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_launch_kind=spawn
+dispatch_choice_reused=0
+META
+printf '%s\n' \
+  '{"event":"observation","event_id":"obs-legacy-generationless","task_id":"legacy-finish-task","generation":"defect-scope-generation","quality":{"status":"bug-found","defect_origin":"validation-correction","defect_origin_explicit":true}}' \
+  >> "$scope_ledger"
+FM_DATA_OVERRIDE="$defect_scope_dir/data" "$METRICS" finish "$defect_scope_dir/state/legacy-finish-task.meta" "$defect_scope_dir/state/legacy-finish-task.dispatch-choice.json" landed || fail "legacy-finish defect-scope finish failed"
+legacy_scope=$(jq -c -s 'map(select(.event=="finish" and .task_id=="legacy-finish-task"))[0].quality.defect_attribution | {origin, evidence: (.evidence | length), unscoped: [.unscoped_evidence[].event_id], basis}' "$scope_ledger")
+[ "$legacy_scope" = '{"origin":"unknown","evidence":0,"unscoped":["obs-legacy-generationless"],"basis":"the finish record carries no generation token, so recorded defects cannot be scoped to this task lifetime"}' ] \
+  || fail "a generationless finish record did not keep defect evidence unscoped: $legacy_scope"
 
 claude_dir="$TMP_ROOT/claude"
 mkdir -p "$claude_dir/data" "$claude_dir/state" "$claude_dir/config/projects/worktree"

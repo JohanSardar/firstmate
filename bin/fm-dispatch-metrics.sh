@@ -3,11 +3,12 @@
 #
 # Internal lifecycle calls:
 #   fm-dispatch-metrics.sh launch <meta-path> <choice-path>
-#   fm-dispatch-metrics.sh finish <meta-path> <choice-path> <outcome>
+#   fm-dispatch-metrics.sh finish <meta-path> <choice-path> <outcome> [discard-authorized]
 #
 # Later observations:
-#   fm-dispatch-metrics.sh observe <task-id> [--model-used <provider/model>]
-#     [--effort-used <level>] [--fast-server-verified on|off|unknown]
+#   fm-dispatch-metrics.sh observe <task-id> [--generation <token>]
+#     [--model-used <provider/model>] [--effort-used <level>]
+#     [--fast-server-verified on|off|unknown]
 #     [--quality passed|bug-found|bug-escaped|unknown]
 #     [--defect-origin original-implementation-worker|validation-correction|pre-existing-code|unknown]
 #     [--usage '<json object with kind>'] [--basis <source>]
@@ -15,7 +16,14 @@
 #
 # --defect-origin attributes a recorded bug-found or bug-escaped observation to
 # a party, with --basis as its evidence. Without it a defect stays unknown; a
-# bare quality status never implies an origin.
+# bare quality status never implies an origin, and any recorded defect with an
+# absent or unknown origin blocks a task-level attribution.
+#
+# Every observation is stamped with a task generation token: --generation wins,
+# otherwise the most recent launch-prepared record for the task supplies it, so
+# a finish event can scope the evidence to its own task lifetime. finish's
+# optional discard-authorized value is true or false and records whether the
+# cleanup discarded the local copy under explicit discard authorization.
 #
 # Records append to data/dispatch-metrics.jsonl. Subscription cost is always an
 # estimate, never billing: a weekly estimate is emitted only when all inputs are
@@ -31,7 +39,7 @@ LEDGER=$DATA/dispatch-metrics.jsonl
 NODE=${NODE:-node}
 
 usage() {
-  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -49,7 +57,15 @@ case "$command" in
       --meta "$2" --choice "$3" --ledger "$LEDGER"
     ;;
   finish)
-    [ "$#" -eq 4 ] || { usage >&2; exit 2; }
+    [ "$#" -ge 4 ] && [ "$#" -le 5 ] || { usage >&2; exit 2; }
+    case "${5:-}" in
+      ''|true|false) ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    if [ "$#" -eq 5 ]; then
+      exec "$NODE" "$SCRIPT_DIR/fm-dispatch-metrics.mjs" finish \
+        --meta "$2" --choice "$3" --ledger "$LEDGER" --outcome "$4" --discard-authorized "$5"
+    fi
     exec "$NODE" "$SCRIPT_DIR/fm-dispatch-metrics.mjs" finish \
       --meta "$2" --choice "$3" --ledger "$LEDGER" --outcome "$4"
     ;;

@@ -127,6 +127,33 @@ function readRecordedLaunches(ledger, taskID, generation) {
   }
   return { status: "complete", launches, reason: null };
 }
+// The generation token one observation belongs to: explicit when the operator
+// supplies it, otherwise the most recent launch-prepared record for the task,
+// which is the task lifetime the durable ledger was last told about. A ledger
+// whose latest launch carries no token yields null rather than a guess, and the
+// recorded basis says which of the two produced the token.
+function observationGeneration(ledger, taskID, requested) {
+  if (typeof requested === "string") {
+    if (!requested) fail("--generation must be a non-empty task generation token");
+    return { generation: requested, basis: "explicit" };
+  }
+  let latest = null;
+  if (existsSync(ledger)) {
+    for (const line of readFileSync(ledger, "utf8").split("\n")) {
+      if (!line) continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        fail(`dispatch metrics ledger ${ledger} contains malformed JSON`);
+      }
+      if (event.event !== "launch-prepared" || event.task_id !== taskID) continue;
+      latest = event;
+    }
+  }
+  const generation = typeof latest?.generation === "string" && latest.generation ? latest.generation : null;
+  return { generation, basis: generation === null ? "no-generation-token" : "latest-recorded-launch" };
+}
 // Every runtime session those launches recorded, oldest first, deduplicated by
 // harness+session. A relaunch re-mints the session id (Claude and Grok refuse a
 // reused id), so the finish event aggregates every incarnation the ledger
@@ -904,12 +931,20 @@ const DEFECT_ORIGINS = new Set(["original-implementation-worker", "validation-co
 // a defect that cannot be attributed stays unknown on its own defect record,
 // never defaulted to the worker that happened to be running.
 const DEFECT_QUALITY_STATUSES = new Set(["bug-found", "bug-escaped"]);
-// The finish event's defect attribution. Only an explicit origin recorded by an
-// observation event counts as evidence: a bare quality status never implies
-// who caused a defect, and disagreeing recorded origins stay unknown rather
-// than being resolved by the most common one.
-function defectAttribution(ledger, taskID) {
+// The finish event's defect attribution, scoped to the task generation.
+// Observations are scoped by their recorded generation token: an observation
+// from another generation, or one carrying no token at all (legacy evidence
+// written before observation events were stamped), is preserved as unscoped
+// evidence but can never be inherited by this generation, so a reused task id
+// does not absorb an earlier task lifetime's defects. Within the generation,
+// only observations that actually record a defect are evidence, and any such
+// defect whose origin is absent or unknown blocks a specific attribution
+// whether or not the unknown was explicit: one defect without a proven cause
+// makes the task-level claim unprovable. Disagreeing known origins stay
+// unknown rather than being resolved by the most common one.
+function defectAttribution(ledger, taskID, generation) {
   const evidence = [];
+  const unscoped = [];
   if (existsSync(ledger)) {
     for (const line of readFileSync(ledger, "utf8").split("\n")) {
       if (!line) continue;
@@ -921,44 +956,41 @@ function defectAttribution(ledger, taskID) {
       }
       if (event.event !== "observation" || event.task_id !== taskID || !object(event.quality)) continue;
       if (!DEFECT_QUALITY_STATUSES.has(event.quality.status)) continue;
-      const origin = event.quality.defect_origin;
-      if (typeof origin !== "string" || !DEFECT_ORIGINS.has(origin)) continue;
-      evidence.push({
-        origin,
+      const recorded = event.quality.defect_origin;
+      const known = typeof recorded === "string" && DEFECT_ORIGINS.has(recorded);
+      const entry = {
+        origin: known ? recorded : "unknown",
+        // The raw value is kept so an absent or unrecognized origin is
+        // distinguishable from an explicitly recorded "unknown".
+        origin_recorded: known ? recorded : null,
         explicit: event.quality.defect_origin_explicit === true,
         status: event.quality.status ?? null,
         basis: event.quality.defect_origin_basis ?? event.quality.basis ?? null,
         event_id: event.event_id ?? null,
-      });
+        generation: typeof event.generation === "string" && event.generation ? event.generation : null,
+      };
+      if (generation && entry.generation === generation) evidence.push(entry);
+      else unscoped.push(entry);
     }
   }
-  const explicitUnknown = evidence.filter((entry) => entry.origin === "unknown" && entry.explicit);
-  const explicit = evidence.filter((entry) => entry.origin !== "unknown");
-  if (explicitUnknown.length > 0) {
-    return {
-      origin: "unknown",
-      basis: "at least one recorded defect was explicitly left without a proven origin",
-      evidence,
-    };
+  const attribution = (origin, basis) => ({ origin, basis, generation: generation ?? null, evidence, unscoped_evidence: unscoped });
+  if (!generation) {
+    return attribution("unknown", "the finish record carries no generation token, so recorded defects cannot be scoped to this task lifetime");
   }
-  if (explicit.length === 0) {
-    return {
-      origin: "unknown",
-      basis: evidence.length === 0
-        ? "no defect origin was observed for this task"
-        : "every recorded defect origin was unknown",
-      evidence,
-    };
+  const unknownOrigin = evidence.filter((entry) => entry.origin === "unknown");
+  if (unknownOrigin.length > 0) {
+    return attribution("unknown", `at least one recorded defect had no proven origin (${unknownOrigin.map((entry) => entry.event_id ?? "unknown").join(", ")})`);
   }
-  const origins = [...new Set(explicit.map((entry) => entry.origin))];
+  if (evidence.length === 0) {
+    return attribution("unknown", unscoped.length > 0
+      ? `no defect origin was observed for this task generation; ${unscoped.length} defect observation(s) from another generation or without a generation token were not inherited`
+      : "no defect origin was observed for this task generation");
+  }
+  const origins = [...new Set(evidence.map((entry) => entry.origin))];
   if (origins.length !== 1) {
-    return { origin: "unknown", basis: `recorded defect origins disagree (${origins.join(", ")})`, evidence };
+    return attribution("unknown", `recorded defect origins disagree (${origins.join(", ")})`);
   }
-  return {
-    origin: origins[0],
-    basis: `recorded by explicit defect-origin observation(s) ${explicit.map((entry) => entry.event_id).join(", ")}`,
-    evidence,
-  };
+  return attribution(origins[0], `recorded by defect-origin observation(s) ${evidence.map((entry) => entry.event_id).join(", ")}`);
 }
 function launchSettings(record, fields) {
   const requested = record.selected;
@@ -1038,6 +1070,10 @@ if (command === "launch" || command === "finish") {
     });
   } else {
     if (!args.outcome) fail("finish needs --outcome");
+    if (args["discard-authorized"] !== undefined && !["true", "false"].includes(args["discard-authorized"])) {
+      fail("finish --discard-authorized must be true or false");
+    }
+    const discardAuthorized = args["discard-authorized"] === "true" ? true : args["discard-authorized"] === "false" ? false : null;
     const started = Number(fields.dispatch_started_epoch);
     const finished = Math.floor(Date.now() / 1000);
     // No compatibility fallback: the generation token is the only scoping
@@ -1060,6 +1096,13 @@ if (command === "launch" || command === "finish") {
       finished_at: nowISO(),
       duration_seconds: Number.isFinite(started) && started > 0 && finished >= started ? finished - started : null,
       delivery_outcome: args.outcome,
+      // Whether this cleanup discarded the task's local copy under explicit
+      // discard authorization (--force). It is a separate axis from the
+      // delivery outcome: a landed delivery whose local copy was discarded
+      // under authorization is not a discarded delivery, and the two fields
+      // together distinguish that case from genuinely discarded, unlanded work
+      // and from a delivery that could not be proved either way.
+      cleanup: { discard_authorized: discardAuthorized },
       // Explicit incarnation totals for this task generation, scoped by the
       // same generation token as the session aggregation above and independent
       // of any session or subagent count the runtime observation happens to
@@ -1071,9 +1114,10 @@ if (command === "launch" || command === "finish") {
       runtime_observed: runtimeObserved,
       usage: runtimeObserved?.usage || { status: "unknown", reason: "no task-attributable provider usage observation was supplied" },
       // Delivery success and a bare quality status are never evidence that no
-      // bug was found or escaped, and a recorded defect is attributed to a
-      // specific party only when an explicit observation says so.
-      quality: { status: "unknown", reason: "delivery success is not evidence that no bug was found or escaped", defect_attribution: defectAttribution(args.ledger, record.task_id) },
+      // bug was found or escaped. A recorded defect is attributed to a specific
+      // party only when exactly one known origin was recorded for this task
+      // generation and no recorded defect in it lacks a proven origin.
+      quality: { status: "unknown", reason: "delivery success is not evidence that no bug was found or escaped", defect_attribution: defectAttribution(args.ledger, record.task_id, generation) },
       cost: {
         kind: "subscription-quota-share",
         status: "unknown",
@@ -1092,12 +1136,18 @@ if (command === "observe") {
   if (!existsSync(args.ledger) || !readFileSync(args.ledger, "utf8").includes(`\"task_id\":\"${args.task}\"`)) {
     fail(`dispatch metrics ledger has no profiled launch for task '${args.task}'`);
   }
+  const observationScope = observationGeneration(args.ledger, args.task, args.generation);
   const event = {
     schema_version: 1,
     event: "observation",
     event_id: `observation:${args.task}:${Date.now()}:${process.pid}`,
     recorded_at: nowISO(),
     task_id: args.task,
+    // Defect and other later observations are stamped with the task generation
+    // they describe, so a finish event for a reused task id can scope them to
+    // its own lifetime instead of inheriting an earlier task's evidence.
+    generation: observationScope.generation,
+    generation_basis: observationScope.basis,
   };
   if (args["fast-server-verified"] && !["on", "off", "unknown"].includes(args["fast-server-verified"])) {
     fail("--fast-server-verified must be on, off, or unknown");
