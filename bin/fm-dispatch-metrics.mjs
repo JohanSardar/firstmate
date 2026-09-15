@@ -84,80 +84,175 @@ function findNamed(root, name, depth = 3) {
   }
   return found;
 }
-function collectRuntime(choicePath, fields) {
+// Every runtime session a preset launch recorded for this task, oldest first.
+// A relaunch re-mints the session id (Claude and Grok refuse a reused id), so
+// the finish event must aggregate every incarnation the ledger recorded rather
+// than counting only the last one.
+function readRecordedSessions(ledger, taskID) {
+  if (!existsSync(ledger)) return [];
+  const sessions = [];
+  for (const line of readFileSync(ledger, "utf8").split("\n")) {
+    if (!line) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      fail(`dispatch metrics ledger ${ledger} contains malformed JSON`);
+    }
+    if (event.event !== "launch-prepared" || event.task_id !== taskID) continue;
+    if (typeof event.runtime_session !== "string" || !event.runtime_session) continue;
+    if (sessions.some((entry) => entry.session === event.runtime_session)) continue;
+    sessions.push({ session: event.runtime_session, harness: event.effective?.harness ?? null });
+  }
+  return sessions;
+}
+function collectClaudeSession(session) {
+  const root = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects");
+  const matches = findNamed(root, `${session}.jsonl`, 3);
+  if (matches.length !== 1) return {
+    session_id: session,
+    status: "unknown",
+    reason: `expected one Claude transcript, found ${matches.length}`,
+  };
+  let model = null;
+  let effort = null;
+  let speed = null;
+  let serviceTier = null;
+  const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
+  const counted = new Set();
+  let unidentified = false;
+  for (const line of readFileSync(matches[0], "utf8").split("\n")) {
+    if (!line) continue;
+    let item;
+    try { item = JSON.parse(line); } catch { continue; }
+    if (item.type !== "assistant" || !object(item.message)) continue;
+    model = item.message.model || model;
+    effort = item.effort || effort;
+    const usage = item.message.usage;
+    if (!object(usage)) continue;
+    const messageID = item.message.id;
+    if (typeof messageID !== "string" || !messageID) {
+      unidentified = true;
+      continue;
+    }
+    if (counted.has(messageID)) continue;
+    counted.add(messageID);
+    totals.input_tokens += Number(usage.input_tokens) || 0;
+    totals.cache_read_tokens += Number(usage.cache_read_input_tokens) || 0;
+    totals.cache_creation_tokens += Number(usage.cache_creation_input_tokens) || 0;
+    totals.output_tokens += Number(usage.output_tokens) || 0;
+    totals.thinking_tokens += Number(usage.output_tokens_details?.thinking_tokens) || 0;
+    speed = usage.speed || speed;
+    serviceTier = usage.service_tier || serviceTier;
+  }
+  return {
+    session_id: session,
+    status: model ? "observed" : "unknown",
+    basis: "local-claude-transcript",
+    model_used: model,
+    effort_used: effort,
+    speed,
+    service_tier: serviceTier,
+    usage: !model ? null : unidentified
+      ? { status: "unknown", kind: "tokens", reason: "transcript usage without a stable assistant message id cannot be deduplicated" }
+      : { status: "recorded-local", kind: "tokens", responses: counted.size, ...totals, completeness: "not-proven-for-aborted-turns" },
+  };
+}
+function incompleteRuntime(basis, observations, latest) {
+  const missing = observations.filter((entry) => entry.status !== "observed" || entry.usage?.status !== "recorded-local");
+  return {
+    status: "unknown",
+    basis,
+    session_id: latest?.session_id ?? null,
+    sessions: observations.map((entry) => ({ session_id: entry.session_id, status: entry.usage?.status ?? entry.status })),
+    model_used: latest?.model_used ?? null,
+    effort_used: latest?.effort_used ?? null,
+    reason: `relaunch incarnation(s) without a complete local record: ${missing.map((entry) => entry.session_id).join(",")}`,
+  };
+}
+function collectClaude(sessions) {
+  const observations = sessions.map(collectClaudeSession);
+  if (observations.length === 1) return observations[0];
+  const latest = observations[observations.length - 1];
+  if (observations.some((entry) => entry.status !== "observed" || entry.usage?.status !== "recorded-local")) {
+    const incomplete = incompleteRuntime("local-claude-transcript", observations, latest);
+    return {
+      ...incomplete,
+      usage: { status: "unknown", kind: "tokens", reason: incomplete.reason },
+    };
+  }
+  const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
+  let responses = 0;
+  for (const entry of observations) {
+    responses += entry.usage.responses;
+    for (const key of Object.keys(totals)) totals[key] += entry.usage[key] ?? 0;
+  }
+  return {
+    status: "observed",
+    basis: "local-claude-transcript",
+    session_id: latest.session_id,
+    sessions: observations.map((entry) => entry.session_id),
+    model_used: latest.model_used,
+    effort_used: latest.effort_used,
+    speed: latest.speed,
+    service_tier: latest.service_tier,
+    usage: {
+      status: "recorded-local",
+      kind: "tokens",
+      responses,
+      ...totals,
+      incarnations: observations.length,
+      completeness: "not-proven-for-aborted-turns",
+    },
+  };
+}
+function collectGrokSession(session) {
+  const root = join(process.env.GROK_HOME || join(homedir(), ".grok"), "sessions");
+  const matches = findNamed(root, "summary.json", 3).filter((path) => path.split("/").includes(session));
+  if (matches.length !== 1) return {
+    session_id: session,
+    status: "unknown",
+    reason: `expected one Grok session summary, found ${matches.length}`,
+  };
+  const summary = readJson(matches[0], "Grok session summary");
+  return {
+    session_id: session,
+    status: summary.current_model_id ? "observed" : "unknown",
+    basis: "local-grok-session-summary",
+    model_used: summary.current_model_id || null,
+    effort_used: summary.reasoning_effort || null,
+  };
+}
+function collectGrok(sessions) {
+  const observations = sessions.map(collectGrokSession);
+  if (observations.length === 1) return observations[0];
+  const latest = observations[observations.length - 1];
+  if (observations.some((entry) => entry.status !== "observed")) {
+    return incompleteRuntime("local-grok-session-summary", observations, latest);
+  }
+  return {
+    status: "observed",
+    basis: "local-grok-session-summary",
+    session_id: latest.session_id,
+    sessions: observations.map((entry) => entry.session_id),
+    model_used: latest.model_used,
+    effort_used: latest.effort_used,
+  };
+}
+function collectRuntime(choicePath, fields, recordedSessions) {
   const runtimePath = choicePath.replace(/\.dispatch-choice\.json$/, ".dispatch-runtime.json");
   if (existsSync(runtimePath)) return readJson(runtimePath, "dispatch runtime observation");
-  const session = fields.dispatch_runtime_session;
-  if (!session) return null;
-  if (fields.harness === "claude") {
-    const root = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects");
-    const matches = findNamed(root, `${session}.jsonl`, 3);
-    if (matches.length !== 1) return {
-      status: "unknown",
-      session_id: session,
-      reason: `expected one Claude transcript, found ${matches.length}`,
-    };
-    let model = null;
-    let effort = null;
-    let speed = null;
-    let serviceTier = null;
-    const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
-    const counted = new Set();
-    let unidentified = false;
-    for (const line of readFileSync(matches[0], "utf8").split("\n")) {
-      if (!line) continue;
-      let item;
-      try { item = JSON.parse(line); } catch { continue; }
-      if (item.type !== "assistant" || !object(item.message)) continue;
-      model = item.message.model || model;
-      effort = item.effort || effort;
-      const usage = item.message.usage;
-      if (!object(usage)) continue;
-      const messageID = item.message.id;
-      if (typeof messageID !== "string" || !messageID) {
-        unidentified = true;
-        continue;
-      }
-      if (counted.has(messageID)) continue;
-      counted.add(messageID);
-      totals.input_tokens += Number(usage.input_tokens) || 0;
-      totals.cache_read_tokens += Number(usage.cache_read_input_tokens) || 0;
-      totals.cache_creation_tokens += Number(usage.cache_creation_input_tokens) || 0;
-      totals.output_tokens += Number(usage.output_tokens) || 0;
-      totals.thinking_tokens += Number(usage.output_tokens_details?.thinking_tokens) || 0;
-      speed = usage.speed || speed;
-      serviceTier = usage.service_tier || serviceTier;
-    }
-    return {
-      status: model ? "observed" : "unknown",
-      basis: "local-claude-transcript",
-      session_id: session,
-      model_used: model,
-      effort_used: effort,
-      speed,
-      service_tier: serviceTier,
-      usage: !model ? null : unidentified
-        ? { status: "unknown", kind: "tokens", reason: "transcript usage without a stable assistant message id cannot be deduplicated" }
-        : { status: "recorded-local", kind: "tokens", responses: counted.size, ...totals, completeness: "not-proven-for-aborted-turns" },
-    };
+  const ordered = [];
+  for (const entry of recordedSessions) {
+    if (entry.harness !== null && entry.harness !== fields.harness) continue;
+    if (!ordered.includes(entry.session)) ordered.push(entry.session);
   }
-  if (fields.harness === "grok") {
-    const root = join(process.env.GROK_HOME || join(homedir(), ".grok"), "sessions");
-    const matches = findNamed(root, "summary.json", 3).filter((path) => path.split("/").includes(session));
-    if (matches.length !== 1) return {
-      status: "unknown",
-      session_id: session,
-      reason: `expected one Grok session summary, found ${matches.length}`,
-    };
-    const summary = readJson(matches[0], "Grok session summary");
-    return {
-      status: summary.current_model_id ? "observed" : "unknown",
-      basis: "local-grok-session-summary",
-      session_id: session,
-      model_used: summary.current_model_id || null,
-      effort_used: summary.reasoning_effort || null,
-    };
+  if (fields.dispatch_runtime_session && !ordered.includes(fields.dispatch_runtime_session)) {
+    ordered.push(fields.dispatch_runtime_session);
   }
+  if (ordered.length === 0) return null;
+  if (fields.harness === "claude") return collectClaude(ordered);
+  if (fields.harness === "grok") return collectGrok(ordered);
   return null;
 }
 function launchSettings(record, fields) {
@@ -174,10 +269,10 @@ function launchSettings(record, fields) {
       harness: fields.harness,
       model: fields.model === "default" ? null : fields.model,
       effort: fields.effort === "default" ? null : fields.effort,
-      // Pi runs provider-request handlers in extension load order and a later
-      // discovered extension can replace the payload, so a requested fast
-      // value is never claimed as the effective wire value; server_verified
-      // stays false until response evidence exists.
+      // A requested fast value is never claimed as the effective wire value,
+      // because the launch plan proves only which handler registers last, not
+      // what the provider did with the payload; server_verified stays false
+      // until response evidence exists.
       fast: null,
       fast_basis: requestedFast === null ? null : "requested-not-wire-verified",
       basis: "validated-launch-control",
@@ -224,7 +319,7 @@ if (command === "launch" || command === "finish") {
     if (!args.outcome) fail("finish needs --outcome");
     const started = Number(fields.dispatch_started_epoch);
     const finished = Math.floor(Date.now() / 1000);
-    const runtimeObserved = collectRuntime(args.choice, fields);
+    const runtimeObserved = collectRuntime(args.choice, fields, readRecordedSessions(args.ledger, record.task_id));
     append(args.ledger, {
       schema_version: 1,
       event: "finish",

@@ -219,4 +219,57 @@ observed=$(jq -c -s 'map(select(.event=="finish"))[1] | {status: .runtime_observ
 [ "$observed" = '{"status":"observed","model":"claude-opus-5","usage":"unknown"}' ] \
   || fail "Claude usage without message identity was not kept unknown: $observed"
 
+# A relaunch re-mints the runtime session id and records a second
+# launch-prepared event. The finish event must aggregate every recorded
+# incarnation instead of counting only the last one, and it must stay unknown
+# when any incarnation's local record is unavailable.
+relaunch_dir="$TMP_ROOT/claude-relaunch"
+mkdir -p "$relaunch_dir/data" "$relaunch_dir/state" "$relaunch_dir/config/projects/worktree"
+printf '%s\n' '{"schema_version":1,"presets":{"claude-fixed":{"mode":"fixed","candidate":{"id":"opus","harness":"claude","model":"opus","effort":"medium"}}}}' > "$relaunch_dir/config.json"
+relaunch_choice=$(FM_STATE_OVERRIDE="$relaunch_dir/state" "$PRESET" select relaunch-task claude-fixed "$relaunch_dir/config.json") || fail "relaunch choice failed"
+printf '%s\n' "$relaunch_choice" > "$relaunch_dir/state/relaunch-task.dispatch-choice.json"
+write_relaunch_meta() {
+  cat > "$relaunch_dir/state/relaunch-task.meta" <<META
+harness=claude
+kind=ship
+model=opus
+effort=medium
+spawn_gen=$1
+dispatch_preset=claude-fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_runtime_session=$2
+META
+}
+session_a=aaaaaaaa-1111-2222-3333-444444444444
+session_b=bbbbbbbb-1111-2222-3333-444444444444
+write_relaunch_meta s1 "$session_a"
+FM_DATA_OVERRIDE="$relaunch_dir/data" "$METRICS" launch \
+  "$relaunch_dir/state/relaunch-task.meta" "$relaunch_dir/state/relaunch-task.dispatch-choice.json" || fail "first incarnation launch metric failed"
+write_relaunch_meta s2 "$session_b"
+FM_DATA_OVERRIDE="$relaunch_dir/data" "$METRICS" launch \
+  "$relaunch_dir/state/relaunch-task.meta" "$relaunch_dir/state/relaunch-task.dispatch-choice.json" || fail "second incarnation launch metric failed"
+{
+  printf '%s\n' '{"type":"user","message":{"role":"user","content":"go"}}'
+  printf '{"type":"assistant","effort":"medium","message":{"id":"msg_a","model":"claude-opus-5","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5,"output_tokens":30,"output_tokens_details":{"thinking_tokens":7},"speed":"standard","service_tier":"priority"},"content":[{"type":"text"}]}}\n'
+  printf '{"type":"assistant","effort":"medium","message":{"id":"msg_b","model":"claude-opus-5","usage":{"input_tokens":20,"cache_read_input_tokens":200,"cache_creation_input_tokens":0,"output_tokens":50,"output_tokens_details":{"thinking_tokens":0},"speed":"fast"},"content":[{"type":"text"}]}}\n'
+} > "$relaunch_dir/config/projects/worktree/$session_a.jsonl"
+printf '{"type":"assistant","effort":"medium","message":{"id":"msg_c","model":"claude-opus-5","usage":{"input_tokens":1,"cache_read_input_tokens":2,"cache_creation_input_tokens":3,"output_tokens":4,"output_tokens_details":{"thinking_tokens":5},"speed":"fast","service_tier":"default"},"content":[{"type":"text"}]}}\n' > "$relaunch_dir/config/projects/worktree/$session_b.jsonl"
+CLAUDE_CONFIG_DIR="$relaunch_dir/config" FM_DATA_OVERRIDE="$relaunch_dir/data" "$METRICS" finish \
+  "$relaunch_dir/state/relaunch-task.meta" "$relaunch_dir/state/relaunch-task.dispatch-choice.json" landed || fail "relaunch finish metric failed"
+relaunch_ledger="$relaunch_dir/data/dispatch-metrics.jsonl"
+aggregated=$(jq -c -s 'map(select(.event=="finish"))[0].runtime_observed | {status, sessions, model_used, effort_used, speed, service_tier, usage: (.usage | {status, responses, incarnations, input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, thinking_tokens})}' "$relaunch_ledger")
+[ "$aggregated" = "{\"status\":\"observed\",\"sessions\":[\"$session_a\",\"$session_b\"],\"model_used\":\"claude-opus-5\",\"effort_used\":\"medium\",\"speed\":\"fast\",\"service_tier\":\"default\",\"usage\":{\"status\":\"recorded-local\",\"responses\":3,\"incarnations\":2,\"input_tokens\":31,\"cache_read_tokens\":302,\"cache_creation_tokens\":8,\"output_tokens\":84,\"thinking_tokens\":12}}" ] \
+  || fail "relaunch usage was not aggregated across both incarnations: $aggregated"
+
+# Drop the latest incarnation's transcript: the finish event must not present a
+# partial sum as a recorded observation.
+rm -f "$relaunch_dir/config/projects/worktree/$session_b.jsonl"
+write_relaunch_meta s3 "$session_b"
+CLAUDE_CONFIG_DIR="$relaunch_dir/config" FM_DATA_OVERRIDE="$relaunch_dir/data" "$METRICS" finish \
+  "$relaunch_dir/state/relaunch-task.meta" "$relaunch_dir/state/relaunch-task.dispatch-choice.json" landed || fail "relaunch partial finish metric failed"
+partial=$(jq -c -s 'map(select(.event=="finish"))[1] | {status: .runtime_observed.status, sessions: .runtime_observed.sessions, usage: .usage.status, reason: .runtime_observed.usage.reason}' "$relaunch_ledger")
+case "$partial" in *'"status":"unknown"'*) ;; *) fail "incomplete relaunch observation was not unknown: $partial" ;; esac
+case "$partial" in *"$session_b"*) ;; *) fail "incomplete relaunch observation did not name the unavailable incarnation: $partial" ;; esac
+
 echo "PASS: task/model presets are deterministic, weighted, explicit on unavailability, and conservatively measured"

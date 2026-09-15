@@ -1713,6 +1713,25 @@ It verifies native `ultra` on initial and operational turns and after restart, s
 Its native App Server peer and watcher-close process are deterministic fixtures; it does not claim a real backend or a live model was tested by that command.
 `tests/fm-busy-state.test.sh`, `tests/fm-busy-adapter-wiring.test.sh`, and `tests/fm-watch-triage.test.sh` cover separate progress notification, unchanged semantic busy state, rejection of a superseded worker's events, and progress refreshing the busy-age bound without fabricating a completed turn.
 
+## Pi exact preset reasoning levels
+
+Verified on 2026-09-15 with the globally installed `@earendil-works/pi-coding-agent` 0.85.1 on macOS 26.5.2 arm64, Node v26.8.1.
+An opt-in preset proves the requested thinking level through the installed package's real `ModelRuntime`/`ModelRegistry` and `getSupportedThinkingLevels` (`bin/fm-pi-reasoning-probe.mjs`), so a level the model does not support refuses before launch instead of being silently clamped to a lower one.
+Run this token-free guard after every Pi upgrade:
+
+```sh
+FM_PI_REASONING_LIVE_E2E=1 bin/fm-test-run.sh tests/fm-pi-reasoning-probe-live-e2e.test.sh
+```
+
+Observed result:
+
+```text
+ok - real Pi SDK 0.85.1 resolves exact thinking levels: a mapped level passes, an unmapped level and an unknown model refuse
+```
+
+The guard declares a local never-contacted `fm-live-fake` provider with a fully mapped model and a partially mapped model, reads no user credential, and makes no provider call.
+`tests/fm-spawn-task-model-preset.test.sh` pins the same refusal path through a full preset spawn against a fixture package and a synthetic catalog, and `tests/fm-pi-launch-plan.test.sh` owns the separate ordered-launch-plan fast guarantee.
+
 ## Oh My Pi (omp)
 
 omp runs crewmate, scout, secondmate, and primary work; [`supervision.md`](supervision.md#omp-oh-my-pi-native-delivery-2026-09-05) owns the primary evidence.

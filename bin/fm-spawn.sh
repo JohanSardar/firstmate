@@ -489,6 +489,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-pi-launch-plan-lib.sh
+. "$SCRIPT_DIR/fm-pi-launch-plan-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -1534,60 +1536,8 @@ pi_supports_tui_mode() {
   printf '%s\n' "$help" | grep -Eq -- '(^|[[:space:]])--tui-mode([[:space:]=]|$)'
 }
 
-# Print a discovered Pi extension that can register its own provider-request
-# hook, or nothing when none is found. Pi runs before_provider_request handlers
-# in extension load order, and the task extension is an explicit -e path that
-# loads before discovered user and project extensions, so any later handler can
-# replace the payload and override a per-worker service_tier request. Discovered
-# extension files and explicit settings.json extension paths are inspected; a
-# configured Pi package is treated as a possible conflict because its hook
-# registrations cannot be read reliably. This is a conflict detector, never a
-# proof that no rewriter exists, which is why the comparison ledger never
-# records a requested fast value as effective.
-pi_provider_request_rewriter_in_path() {  # <file-or-dir>
-  local path=$1 candidate
-  if [ -f "$path" ]; then
-    grep -qF 'before_provider_request' "$path" 2>/dev/null && printf '%s\n' "$path"
-    return 0
-  fi
-  [ -d "$path" ] || return 0
-  while IFS= read -r candidate; do
-    [ -n "$candidate" ] || continue
-    if grep -qF 'before_provider_request' "$candidate" 2>/dev/null; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done < <(find "$path" -maxdepth 2 -type f \( -name '*.ts' -o -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) 2>/dev/null | LC_ALL=C sort)
-  return 0
-}
-
-pi_provider_request_rewriter() {  # <project-dir>
-  local project=$1 agent_dir settings path candidate
-  agent_dir=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
-  for path in "$agent_dir/extensions" "$project/.pi/extensions"; do
-    candidate=$(pi_provider_request_rewriter_in_path "$path") || true
-    [ -n "$candidate" ] || continue
-    printf '%s\n' "$candidate"
-    return 0
-  done
-  settings="$agent_dir/settings.json"
-  [ -f "$settings" ] || return 1
-  if jq -e '((.packages // []) | length > 0)' "$settings" >/dev/null 2>&1; then
-    printf '%s\n' "$settings (configured package list)"
-    return 0
-  fi
-  while IFS= read -r path; do
-    [ -n "$path" ] || continue
-    candidate=$(pi_provider_request_rewriter_in_path "$path") || true
-    [ -n "$candidate" ] || continue
-    printf '%s\n' "$candidate"
-    return 0
-  done < <(jq -r '(.extensions // [])[] | select(type == "string")' "$settings" 2>/dev/null)
-  return 1
-}
-
 dispatch_validate_live_settings() {
-  local listing row provider model_id details auth help_text provider_label conflict
+  local listing row provider model_id details auth help_text provider_label pi_agent_dir pi_package_dir pi_probe pi_plan_reason
   [ -n "$DISPATCH_PRESET" ] || return 0
   if [ -n "$DISPATCH_FAST" ] && [ "$HARNESS" != pi ] && [ "$HARNESS" != pi-signed ]; then
     echo "error: preset '$DISPATCH_PRESET' has a Pi fast setting that cannot be carried by relaunch harness '$HARNESS'" >&2
@@ -1613,16 +1563,39 @@ dispatch_validate_live_settings() {
         echo "error: preset '$DISPATCH_PRESET' selected Pi model '$MODEL' without an exact provider/model id" >&2
         return 1
       }
+      # Pi clamps an unsupported thinking level silently, and --list-models only
+      # exposes a reasoning yes/no column, so the exact level is proven against
+      # the installed package's own model catalog (the same
+      # ModelRuntime/getSupportedThinkingLevels surface
+      # tests/fm-pi-branch-live-e2e.test.sh pins). An unprovable level refuses
+      # before launch instead of launching and silently running a lower one.
+      pi_agent_dir=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
+      pi_package_dir=${FM_PI_PACKAGE_DIR:-$(npm root -g 2>/dev/null)/@earendil-works/pi-coding-agent}
+      if ! pi_probe=$(node "$SCRIPT_DIR/fm-pi-reasoning-probe.mjs" \
+          --package-dir "$pi_package_dir" --agent-dir "$pi_agent_dir" \
+          --model "$MODEL" --effort "$EFFORT" 2>&1); then
+        echo "error: preset '$DISPATCH_PRESET' could not verify exact Pi reasoning support for model '$MODEL' at level '$EFFORT': $pi_probe" >&2
+        return 1
+      fi
       if [ -n "$DISPATCH_FAST" ] && [ "$provider" != openai-codex ]; then
         echo "error: preset '$DISPATCH_PRESET' selected fast=$DISPATCH_FAST for '$MODEL'; per-worker fast control is verified only for openai-codex models" >&2
         return 1
       fi
-      if [ -n "$DISPATCH_FAST" ] && conflict=$(pi_provider_request_rewriter "$PROJ"); then
-        echo "error: preset '$DISPATCH_PRESET' sets fast=$DISPATCH_FAST, but discovered extension '$conflict' can rewrite the provider request after the per-worker extension; the requested fast value cannot be guaranteed (remove the fast setting from this candidate or stop loading that extension)" >&2
-        return 1
+      if [ -n "$DISPATCH_FAST" ]; then
+        # The resolved launch plan is the only fast authority: this spawn
+        # delivers its explicit -e task extension but no --no-extensions, so a
+        # fixed fast value cannot be proven to survive a later discovered
+        # extension's handler and is refused rather than claimed. A launcher
+        # whose plan proves --no-extensions with the task extension last
+        # satisfies the same helper and is allowed.
+        if ! pi_plan_reason=$(fm_pi_fast_plan_guarantees "$STATE/$ID.pi-ext.ts" \
+            -e "$STATE/$ID.pi-ext.ts"); then
+          echo "error: preset '$DISPATCH_PRESET' sets fast=$DISPATCH_FAST, but the resolved Pi launch plan cannot guarantee it ($pi_plan_reason); refusing to launch with a fast value it cannot prove" >&2
+          return 1
+        fi
       fi
-      if [ ! -f "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/auth.json" ] \
-        || ! jq -e --arg provider "$provider" 'has($provider)' "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/auth.json" >/dev/null 2>&1; then
+      if [ ! -f "$pi_agent_dir/auth.json" ] \
+        || ! jq -e --arg provider "$provider" 'has($provider)' "$pi_agent_dir/auth.json" >/dev/null 2>&1; then
         echo "error: preset '$DISPATCH_PRESET' selected Pi provider '$provider', but no matching authenticated provider record is available" >&2
         return 1
       fi
@@ -3789,23 +3762,22 @@ export default function (pi: any) {
     writeFileSync(temp, JSON.stringify(record) + "\\n", { mode: 0o600 });
     renameSync(temp, runtimePath);
   };
+  if (fastRequested !== null) {
+    // Registered once when this extension loads, never inside session_start:
+    // a session_start that fires again would stack duplicate handlers, and
+    // load order - not registration timing - decides which handler's payload
+    // wins. fm-spawn only admits a fixed fast value when its launch-plan check
+    // proved the task extension loads last, so this handler's rewritten
+    // service_tier is final; the ledger still records the value as
+    // requested-only until response evidence exists.
+    pi.on("before_provider_request", (event: any, requestCtx: any) => {
+      const model = requestCtx?.model;
+      if (model?.provider !== "openai-codex" || model?.api !== "openai-codex-responses") return;
+      return { ...event.payload, service_tier: fastRequested ? "priority" : "default" };
+    });
+  }
   if ("$DISPATCH_PRESET") {
-  pi.on("session_start", (_event: any, ctx: any) => {
-    persistRuntime(ctx);
-    if (fastRequested !== null) {
-      // Pi runs before_provider_request handlers in extension load order, and
-      // this explicit -e extension loads before discovered user/project
-      // extensions, so a later handler can replace the payload and override
-      // this request. Fast is therefore recorded as requested only, never as a
-      // verified effective value, and fm-spawn refuses a fixed fast preset
-      // while a discovered extension can register the same hook.
-      pi.on("before_provider_request", (event: any, requestCtx: any) => {
-        const model = requestCtx?.model;
-        if (model?.provider !== "openai-codex" || model?.api !== "openai-codex-responses") return;
-        return { ...event.payload, service_tier: fastRequested ? "priority" : "default" };
-      });
-    }
-  });
+  pi.on("session_start", (_event: any, ctx: any) => persistRuntime(ctx));
   pi.on("model_select", (_event: any, ctx: any) => persistRuntime(ctx));
   pi.on("thinking_level_select", (_event: any, ctx: any) => persistRuntime(ctx));
   }

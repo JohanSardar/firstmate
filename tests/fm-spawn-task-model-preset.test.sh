@@ -25,6 +25,8 @@ make_case() {
   fm_test_spawn_brief "$home" "$id"
   mkdir -p "$home/user-home/.pi/agent"
   printf '%s\n' '{"openai-codex":{"type":"oauth"}}' > "$home/user-home/.pi/agent/auth.json"
+  printf '%s\n' '{"providers":{"openai-codex":{"models":[{"id":"model-pi","name":"model pi","reasoning":true,"thinkingLevelMap":{"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":"max"}}]}}}' \
+    > "$home/user-home/.pi/agent/models.json"
   if [ "$fast" = omit ]; then
     fast_json=
   else
@@ -50,6 +52,57 @@ case "${1:-}" in
 esac
 SH
   chmod +x "$fakebin/pi"
+}
+
+# A fixture stand-in for the installed Pi package: the reasoning probe imports
+# the same ModelRuntime/ModelRegistry surface the real package exposes and reads
+# the synthetic model catalog this suite writes per case.
+install_fake_pi_package() {
+  local package=$1
+  mkdir -p "$package/dist" "$package/node_modules/@earendil-works/pi-ai/dist"
+  cat > "$package/package.json" <<'JSON'
+{"name":"@earendil-works/pi-coding-agent","version":"9.9.9-test","type":"module"}
+JSON
+  cat > "$package/dist/index.js" <<'JS'
+import { readFileSync } from "node:fs";
+function loadModels(modelsPath) {
+  try {
+    const config = JSON.parse(readFileSync(modelsPath, "utf8"));
+    const models = [];
+    for (const [provider, entry] of Object.entries(config.providers ?? {})) {
+      for (const model of entry.models ?? []) models.push({ provider, ...model });
+    }
+    return models;
+  } catch {
+    return [];
+  }
+}
+export class ModelRuntime {
+  static async create({ modelsPath }) {
+    return { modelsPath, models: loadModels(modelsPath) };
+  }
+}
+export class ModelRegistry {
+  constructor(runtime) { this.runtime = runtime; }
+  async refresh() { this.runtime.models = loadModels(this.runtime.modelsPath); }
+  find(provider, id) {
+    return this.runtime.models.find((model) => model.provider === provider && model.id === id) ?? null;
+  }
+}
+JS
+  cat > "$package/node_modules/@earendil-works/pi-ai/dist/compat.js" <<'JS'
+// Pi's own supported-level rule: xhigh and max exist only when the model's
+// thinkingLevelMap defines them, and a null map entry disables a level.
+export function getSupportedThinkingLevels(model) {
+  if (!model.reasoning) return ["off"];
+  return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) return false;
+    if (level === "xhigh" || level === "max") return mapped !== undefined;
+    return true;
+  });
+}
+JS
 }
 
 install_fake_grok() {
@@ -96,6 +149,10 @@ SH
   chmod +x "$fakebin/opencode"
 }
 
+PI_PACKAGE="$TMP_ROOT/pi-package"
+install_fake_pi_package "$PI_PACKAGE"
+export FM_PI_PACKAGE_DIR="$PI_PACKAGE"
+
 run_case() {
   local home=$1 wt=$2 fakebin=$3 id=$4 proj=$5 log=$6
   : > "$log"
@@ -103,7 +160,7 @@ run_case() {
     "$id" "$proj" --scout --preset chosen 2>&1
 }
 
-record=$(make_case pi pi-preset-task pi openai-codex/model-pi max false)
+record=$(make_case pi pi-preset-task pi openai-codex/model-pi max)
 IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
 $record
 EOF
@@ -111,7 +168,10 @@ install_fake_pi "$FAKEBIN_DIR"
 out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-preset-task "$PROJ_DIR" "$DIR/launch.log") || fail "Pi preset spawn failed: $out"
 launch=$(cat "$DIR/launch.log")
 assert_contains "$launch" "--model 'openai-codex/model-pi' --thinking 'max'" "Pi launch settings"
-cat > "$DIR/assert-pi-fast.mjs" <<'JS'
+# The generated Pi extension registers the provider-request hook exactly once
+# when the file loads, never per session_start, so a re-fired session start
+# cannot stack duplicate handlers.
+cat > "$DIR/assert-pi-extension.mjs" <<'JS'
 import { pathToFileURL } from "node:url";
 const callbacks = new Map();
 const pi = {
@@ -122,91 +182,72 @@ const pi = {
 };
 const extension = await import(pathToFileURL(process.argv[2]).href);
 extension.default(pi);
+if ((callbacks.get("before_provider_request") || []).length !== 0) {
+  throw new Error("a preset without fast registered a provider-request handler");
+}
 const context = {
   model: { provider: "openai-codex", id: "model-pi", api: "openai-codex-responses" },
   thinkingLevel: "max",
   sessionManager: { getSessionId: () => "test-session" },
 };
-for (const callback of callbacks.get("session_start") || []) await callback({ type: "session_start" }, context);
-const providerCallbacks = callbacks.get("before_provider_request") || [];
-if (providerCallbacks.length !== 1) throw new Error(`expected one preset provider handler, got ${providerCallbacks.length}`);
-// Pi emits { type, payload } and carries the selected model on the handler context.
-const request = { type: "before_provider_request", payload: { service_tier: "priority", retained: true } };
-const payload = await providerCallbacks[0](request, context);
-if (payload.service_tier !== "default" || payload.retained !== true) {
-  throw new Error(`fast off did not rewrite only service_tier: ${JSON.stringify(payload)}`);
-}
-const untouched = await providerCallbacks[0](request, { model: { provider: "anthropic", id: "other", api: "anthropic-messages" } });
-if (untouched !== undefined) {
-  throw new Error(`fast off rewrote a request for a non-codex model: ${JSON.stringify(untouched)}`);
+const sessionStarts = callbacks.get("session_start") || [];
+if (sessionStarts.length !== 1) throw new Error(`expected one session_start handler, got ${sessionStarts.length}`);
+await sessionStarts[0]({ type: "session_start" }, context);
+await sessionStarts[0]({ type: "session_start" }, context);
+if ((callbacks.get("before_provider_request") || []).length !== 0) {
+  throw new Error("session_start stacked a provider-request handler");
 }
 JS
-node --no-warnings "$DIR/assert-pi-fast.mjs" "$HOME_DIR/state/pi-preset-task.pi-ext.ts" \
-  || fail "generated Pi extension did not apply fast off at runtime"
+node --no-warnings "$DIR/assert-pi-extension.mjs" "$HOME_DIR/state/pi-preset-task.pi-ext.ts" \
+  || fail "generated Pi extension registered a provider hook for a preset without fast"
+runtime="$HOME_DIR/state/pi-preset-task.dispatch-runtime.json"
+[ "$(jq -r '.model_used + " " + .effort_used' "$runtime")" = "openai-codex/model-pi max" ] \
+  || fail "Pi runtime observation was not recorded"
 [ ! -e "$HOME_DIR/user-home/.pi/agent/settings.json" ] || fail "Pi preset changed global settings"
-[ "$(grep '^dispatch_fast=' "$HOME_DIR/state/pi-preset-task.meta")" = dispatch_fast=off ] || fail "Pi requested fast setting was not recorded"
+[ "$(jq -s -r '.[0].effective.effort' "$HOME_DIR/data/dispatch-metrics.jsonl")" = max ] || fail "validated Pi effort was not recorded effective"
 [ "$(jq -s -r '.[0].selection.selected_candidate' "$HOME_DIR/data/dispatch-metrics.jsonl")" = candidate ] || fail "Pi launch provenance was not recorded"
-# A requested fast value is never claimed as the effective wire value, because
-# a later discovered extension can replace the provider payload.
-[ "$(jq -s -r '.[0].effective.fast' "$HOME_DIR/data/dispatch-metrics.jsonl")" = null ] || fail "requested Pi fast was claimed as effective"
-[ "$(jq -s -r '.[0].effective.fast_basis' "$HOME_DIR/data/dispatch-metrics.jsonl")" = requested-not-wire-verified ] || fail "Pi fast basis was not recorded as requested-only"
 
-# A discovered user extension that can register its own provider-request hook
-# makes a fixed fast value unguaranteeable, so the preset refuses before launch.
-record=$(make_case pi-conflict pi-conflict-task pi openai-codex/model-pi max false)
+# A level the model does not map (here max) must refuse before launch: Pi would
+# otherwise clamp it silently to a lower level while the ledger claimed max.
+record=$(make_case pi-unsupported-level pi-unsupported-task pi openai-codex/model-pi max)
 IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
 $record
 EOF
 install_fake_pi "$FAKEBIN_DIR"
-mkdir -p "$HOME_DIR/user-home/.pi/agent/extensions"
-cat > "$HOME_DIR/user-home/.pi/agent/extensions/global-fast.ts" <<'TS'
-export default function (pi) {
-  pi.on("before_provider_request", (event) => ({ ...event.payload, service_tier: "priority" }));
-}
-TS
-set +e
-out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-conflict-task "$PROJ_DIR" "$DIR/launch.log")
-status=$?
-set -e
-[ "$status" -ne 0 ] || fail "a fixed fast preset launched while a discovered extension could rewrite the request"
-assert_contains "$out" "cannot be guaranteed" "fast conflict refusal wording"
-assert_contains "$out" "global-fast.ts" "fast conflict refusal names the conflicting extension"
-[ ! -s "$DIR/launch.log" ] || fail "fast conflict refusal still delivered a launch"
+printf '%s\n' '{"providers":{"openai-codex":{"models":[{"id":"model-pi","name":"model pi","reasoning":true,"thinkingLevelMap":{"low":"low","high":"high","xhigh":"xhigh"}}]}}}' \
+  > "$HOME_DIR/user-home/.pi/agent/models.json"
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-unsupported-task "$PROJ_DIR" "$DIR/launch.log") \
+  && fail "a Pi preset launched a thinking level the model does not support"
+assert_contains "$out" "does not support thinking level 'max'" "unsupported Pi level refusal"
+assert_contains "$out" "supported: off,minimal,low,medium,high,xhigh" "unsupported Pi level supported list"
+[ ! -s "$DIR/launch.log" ] || fail "unsupported Pi level refusal still delivered a launch"
 
-# An explicit settings.json extension path that registers the same hook conflicts
-# the same way, because it loads after the task extension too.
-rm -f "$HOME_DIR/user-home/.pi/agent/extensions/global-fast.ts"
-cat > "$HOME_DIR/user-home/.pi/agent/settings-conflict.ts" <<'TS'
-export default function (pi) {
-  pi.on("before_provider_request", () => undefined);
-}
-TS
-printf '{"extensions":["%s"]}\n' "$HOME_DIR/user-home/.pi/agent/settings-conflict.ts" \
-  > "$HOME_DIR/user-home/.pi/agent/settings.json"
-set +e
-out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-conflict-task "$PROJ_DIR" "$DIR/launch2.log")
-status=$?
-set -e
-[ "$status" -ne 0 ] || fail "a fixed fast preset launched while a configured extension could rewrite the request"
-assert_contains "$out" "settings-conflict.ts" "fast conflict refusal names the configured extension"
-[ ! -s "$DIR/launch2.log" ] || fail "configured-extension refusal still delivered a launch"
-
-# A discovered extension without the request hook does not conflict, so the
-# refusal is targeted at possible payload rewriters rather than any extension.
-record=$(make_case pi-harmless pi-harmless-task pi openai-codex/model-pi max false)
+# A missing installed package cannot prove any exact level, so the launch
+# refuses instead of trusting the --list-models reasoning column.
+record=$(make_case pi-no-package pi-no-package-task pi openai-codex/model-pi max)
 IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
 $record
 EOF
 install_fake_pi "$FAKEBIN_DIR"
-mkdir -p "$HOME_DIR/user-home/.pi/agent/extensions"
-cat > "$HOME_DIR/user-home/.pi/agent/extensions/turn-end.ts" <<'TS'
-export default function (pi) {
-  pi.on("turn_end", () => {});
-}
-TS
-out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-harmless-task "$PROJ_DIR" "$DIR/launch.log") \
-  || fail "a harmless discovered extension blocked a fixed fast preset: $out"
-assert_contains "$(cat "$DIR/launch.log")" "--model 'openai-codex/model-pi' --thinking 'max'" "harmless-extension Pi launch settings"
+out=$(FM_PI_PACKAGE_DIR="$DIR/absent-pi-package" run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-no-package-task "$PROJ_DIR" "$DIR/launch.log") \
+  && fail "a Pi preset launched without a verifiable exact reasoning surface"
+assert_contains "$out" "could not verify exact Pi reasoning support" "missing-package reasoning refusal"
+assert_contains "$out" "installed Pi package not found" "missing-package probe detail"
+[ ! -s "$DIR/launch.log" ] || fail "missing-package refusal still delivered a launch"
+
+# The resolved launch plan is the only fast authority. This spawn delivers its
+# task extension with -e but no --no-extensions, so a fixed fast value cannot be
+# proven to survive a later discovered handler and is refused before launch.
+record=$(make_case pi-fast pi-fast-task pi openai-codex/model-pi max false)
+IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
+$record
+EOF
+install_fake_pi "$FAKEBIN_DIR"
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-fast-task "$PROJ_DIR" "$DIR/launch.log") \
+  && fail "a fixed fast preset launched without a plan that proves the task extension wins"
+assert_contains "$out" "cannot guarantee it (missing --no-extensions)" "fast plan refusal reason"
+assert_contains "$out" "refusing to launch with a fast value it cannot prove" "fast plan refusal wording"
+[ ! -s "$DIR/launch.log" ] || fail "fast plan refusal still delivered a launch"
 
 record=$(make_case grok grok-preset-task grok grok-example xhigh)
 IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
@@ -260,12 +301,9 @@ EOF
 install_fake_opencode "$FAKEBIN_DIR"
 # Remove the credential line while retaining the exact model/variant catalog.
 perl -0pi -e 's/printf '\''%s\\n'\'' '\''Vendor api'\''/printf '\''%s\\n'\'' '\''Other api'\''/' "$FAKEBIN_DIR/opencode"
-set +e
-out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" opencode-noauth-task "$PROJ_DIR" "$DIR/launch.log")
-status=$?
-set -e
-[ "$status" -ne 0 ] || fail "OpenCode preset launched without a matching credential"
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" opencode-noauth-task "$PROJ_DIR" "$DIR/launch.log") \
+  && fail "OpenCode preset launched without a matching credential"
 assert_contains "$out" "has no matching credential" "OpenCode credential refusal"
 [ ! -s "$DIR/launch.log" ] || fail "credential refusal still delivered a launch"
 
-echo "PASS: task/model preset settings reach Pi, Grok, Claude Code, and OpenCode without silent fallback"
+echo "PASS: task/model preset launch controls stay exact across Pi, Grok, Claude Code, and OpenCode"

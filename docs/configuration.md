@@ -507,8 +507,9 @@ Unavailable candidates remain in the draw: if one is sampled, launch stops and r
 Use a new task id for a new experimental draw.
 
 After selection, spawn rechecks the installed tool's live model and setting surface and its usable login where the CLI exposes one.
-Pi requires an exact catalogued `provider/model` with configured provider credentials; explicit fast on or off is restricted to `openai-codex`, where the task extension requests `priority` or `default` for that worker without changing global fast state.
-Because Pi runs provider-request handlers in extension load order and a later discovered user or project extension can replace the payload, spawn refuses a fixed fast value when it finds a discovered extension that can register the same hook, or a configured Pi package list, rather than launching with a setting it cannot guarantee.
+Pi requires an exact catalogued `provider/model` with configured provider credentials and proves the requested thinking level against the installed package's own model catalog through `bin/fm-pi-reasoning-probe.mjs`; a level the model does not support stops the launch rather than letting Pi silently clamp it to a lower level.
+Explicit fast on or off is restricted to `openai-codex`, where the task extension requests `priority` or `default` for that worker without changing global fast state.
+Fast is allowed only when a side-effect-free, launcher-supplied ordered launch plan proves `--no-extensions` with the per-worker task extension as the last extension (`bin/fm-pi-launch-plan-lib.sh`); otherwise spawn refuses the fixed value rather than claiming a load ordering it cannot prove.
 The task-local Pi extension records the effective model and thinking level as the worker's runtime observation, while a requested fast value stays requested-only: the ledger leaves `effective.fast` unclaimed with `fast_basis: requested-not-wire-verified`, and `server_verified` stays false until response evidence is supplied.
 Grok requires `grok models` to report both the exact model and a login; the explicit preset path may pass its currently verified `xhigh` reasoning control while ordinary dispatch retains its older compatible range.
 Claude Code accepts only a current model alias printed by `claude --help`, verifies `claude auth status`, and passes its effort flag.
@@ -519,6 +520,7 @@ Profiled launches append private JSONL events to `data/dispatch-metrics.jsonl` t
 The launch-prepared event records requested versus validated launch settings, tool version, runtime session identity where supported, and complete selection provenance.
 Cleanup appends elapsed task duration, delivery outcome, locally observed effective model data where available, and explicit unknown usage, quality, and cost fields rather than zeros.
 Pi and OpenCode record runtime model observations from their task-local extension or plugin, and the OpenCode plugin records only the worker's main session rather than a subagent child session; Claude and Grok use their selected session identity to collect local model/usage metadata at cleanup when the corresponding local record is unambiguous.
+A relaunch re-mints that session identity, so cleanup aggregates and deduplicates every incarnation the launch ledger recorded, and reports the observation unknown without a partial sum when any incarnation's local record is unavailable.
 Claude transcript usage is counted once per assistant message id, because Claude Code repeats one response's usage on every content-block line; a usage line without that id keeps the usage observation unknown.
 Later model, fast-verification, token usage, and bug/quality observations can be appended with `fm-dispatch-metrics.sh observe`; its help owns the argument shape.
 A subscription estimate is emitted only when quota fraction, monthly price, and a seven-day reset period are all supplied, using `quota_fraction * monthly_price_usd / 4` and the label `estimate-not-invoice`.

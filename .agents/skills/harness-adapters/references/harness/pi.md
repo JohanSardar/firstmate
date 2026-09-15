@@ -12,7 +12,7 @@ Verified on 2026-07-27 with Pi and Pi-signed 0.82.0 unless a fact gives another 
 | Interrupt | Single Escape. |
 | Skill invocation | No separate verified form beyond normal command behavior; use natural language when the exact command is uncertain. |
 | Model flag | `--model <model>`. |
-| Effort flag | `--thinking <low\|medium\|high\|xhigh\|max>`; both identities expose the same levels and completed the same model-qualified max-thinking smoke. |
+| Effort flag | `--thinking <low\|medium\|high\|xhigh\|max>`; both identities expose the same levels and completed the same model-qualified max-thinking smoke. An opt-in preset proves the exact requested level against the installed package's own model catalog (`bin/fm-pi-reasoning-probe.mjs`), because Pi clamps an unsupported level silently. |
 | Model discovery | Run the selected executable as `<executable> --list-models [search]`; Pi's installed `docs/models.md` owns how built-in, extension-registered, and custom provider/model entries reach that list. |
 | Preset fast | Optional boolean for exact `openai-codex` models only; the task extension requests provider `service_tier` `priority` or `default` for that worker and records server verification as false until response evidence exists. |
 
@@ -41,7 +41,7 @@ The decision persists per path in `~/.pi/agent/trust.json`, so later spawns in t
 The extension listens for Pi's `turn_end` event, not `agent_end`, so supervision is notified after each completed turn rather than only when the whole run exits.
 Native-harness progress uses the separate generation-bound marker owned by `../../../bin/fm-busy-event.sh`; it never fabricates Pi turn completion.
 For an opt-in preset, the same extension records Pi's active provider/model, effective thinking level, session identity, and explicit fast request.
-Pi invokes `before_provider_request` handlers in extension load order, and this explicit `-e` extension loads before discovered user and project extensions, so a later extension that registers that hook can replace the payload and override the request; a requested fast value is therefore recorded as requested-only and never claimed as effective, and `bin/fm-spawn.sh` refuses a fixed `fast` value when it finds a discovered extension that can register the same hook.
+Pi invokes `before_provider_request` handlers in extension load order and only the last registered handler owns the payload, so this extension registers its handler once when it loads and `bin/fm-spawn.sh` allows a fixed `fast` value only when a launcher-supplied ordered launch plan proves `--no-extensions` with this task extension last (`bin/fm-pi-launch-plan-lib.sh`); otherwise the value is refused rather than claimed, and the ledger records it as requested-only.
 Nothing in the request path changes global configuration; only the selected worker is affected.
 `before_provider_request` reaches a handler as `{type, payload}` with the selected model on the handler context argument, not on the event (verified 0.85.1), so the rewrite reads `ctx.model` and returns the amended `event.payload`.
 Pi sets `PI_CODING_AGENT=true` for its children as its harness-detection marker.
