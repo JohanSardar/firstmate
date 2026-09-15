@@ -1,0 +1,39 @@
+### validate: every silent-substitution vector is refused with a specific reason (exit 1); the canonical shapes pass (exit 0)
+ok   [exit 1] fast on grok (speed setting unsupported)             -> error: preset 'x' candidate fast is supported only for pi and pi-signed
+ok   [exit 1] fast on claude                                       -> error: preset 'x' candidate fast is supported only for pi and pi-signed
+ok   [exit 1] fast as a string                                     -> error: preset 'x' candidate fast must be true or false
+ok   [exit 1] grok effort xhigh (not launchable)                   -> error: preset 'x' candidate effort 'xhigh' is unsupported for grok
+ok   [exit 1] grok effort max (not launchable)                     -> error: preset 'x' candidate effort 'max' is unsupported for grok
+ok   [exit 1] claude effort "ultra" (unknown level)                -> error: preset 'x' candidate effort 'ultra' is unsupported for claude
+ok   [exit 1] missing effort on pi                                 -> error: preset 'x' candidate needs non-empty effort
+ok   [exit 1] opencode with effort (no enforcing flag)             -> error: preset 'x' candidate effort must be omitted for opencode because no verified launch flag enforces one
+ok   [exit 1] opencode model without provider/ prefix              -> error: preset 'x' candidate OpenCode model must be an exact provider/model id
+ok   [exit 1] unsupported harness codex                            -> error: preset 'x' candidate harness 'codex' is not supported by task/model presets
+ok   [exit 1] model token with whitespace                          -> error: preset 'x' candidate model must be an exact model token without whitespace
+ok   [exit 1] available:false without unavailable_reason           -> error: preset 'x' candidate unavailable candidate needs unavailable_reason
+ok   [exit 1] available as string "no"                             -> error: preset 'x' candidate available must be true or false
+ok   [exit 1] root "default" alias (removed)                       -> error: task/model preset config has unknown field 'default'
+ok   [exit 1] unknown candidate field "provider"                   -> error: preset 'x' candidate has unknown field 'provider'
+ok   [exit 1] weighted preset without seed                         -> error: task/model preset config needs a non-empty seed when any preset is weighted
+ok   [exit 1] weighted preset with one candidate                   -> error: weighted preset 'x' needs at least two candidates and must not have candidate
+ok   [exit 1] weighted duplicate candidate id                      -> error: weighted preset 'x' repeats candidate id 'a'
+ok   [exit 1] zero weight                                          -> error: preset 'x' candidate 1 weight must be a positive number
+ok   [exit 1] weight with seven decimals                           -> error: preset 'x' candidate 1 weight must have at most six decimal places and be at most 1000000
+ok   [exit 1] fixed candidate carrying a weight                    -> error: preset 'x' candidate fixed candidate must not have weight
+ok   [exit 1] mode "random"                                        -> error: preset 'x' mode must be fixed or weighted
+ok   [exit 1] schema_version 2                                     -> error: task/model preset config schema_version must be 1
+ok   [exit 1] empty presets                                        -> error: task/model preset config needs at least one preset
+ok   [exit 1] malformed JSON                                       -> error: task/model preset config /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/schema/c.json is malformed JSON
+ok   [exit 0] pi fixed with fast:true (valid)                      -> <silent>
+ok   [exit 0] grok high / claude xhigh / opencode weighted (valid) -> <silent>
+ok   [exit 0] preset literally named "default" (valid, not an alias) -> <silent>
+
+checks: 28  failures: 0
+missing config file:
+error: cannot read task/model preset config /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/schema/does-not-exist.json: ENOENT: no such file or directory, open '/var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/schema/does-not-exist.json'
+exit=1
+default config path resolution (no arg) with no file present in FM_HOME/config:
+error: cannot read task/model preset config <home>/config/task-model-presets.json: ENOENT: no such file or directory, open '/var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/schema/config/task-model-presets.json'
+exit=1
+bad usage (validate with two args):
+exit=2

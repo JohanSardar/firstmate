@@ -1,0 +1,40 @@
+### Primary home config/ before propagation
+  primary: backlog-backend
+  primary: crew-dispatch.json
+  primary: task-model-presets.json
+
+### Declared inheritable item set (fm_config_inherit_items) — the single allowlist that spawn, bootstrap, config-push and remote push all derive from
+  config/crew-dispatch.json
+  config/crew-harness
+  config/backlog-backend
+  config/backend
+  config/herdr-presentation-spaces
+  config/startup-memory-budget
+  config/trace-context
+  config/launch-env-allowlist
+  config/claude-permission-mode
+  data/captain-shared.md
+
+### propagate_secondmate_inheritance primary -> secondmate (same machinery bootstrap/spawn/config-push call)
+exit=0
+per-item report:
+  crew-dispatch.json	pushed	
+  crew-harness	unchanged	
+  backlog-backend	pushed	
+  backend	unchanged	
+  herdr-presentation-spaces	unchanged	
+  startup-memory-budget	unchanged	
+  trace-context	unchanged	
+  launch-env-allowlist	unchanged	
+  claude-permission-mode	unchanged	
+  data/captain-shared.md	unchanged	
+
+### Secondmate home config/ after propagation
+  secondmate: backlog-backend
+  secondmate: crew-dispatch.json
+RESULT: task-model-presets.json NOT inherited (crew-dispatch.json and backlog-backend were), secondmate memory untouched: secondmate-private project memory
+
+### A stale/foreign copy already in the secondmate home is also left alone (not mirrored away, not overwritten) - each home owns its own experiment
+exit=0
+  report lines mentioning task-model-presets: 0
+  secondmate preset names after 2nd propagation: own

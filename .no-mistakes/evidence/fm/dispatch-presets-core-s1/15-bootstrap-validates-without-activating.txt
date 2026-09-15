@@ -1,0 +1,32 @@
+# Isolated FM_HOME (temp), real PATH toolchain, FM_BOOTSTRAP_NETWORK=skip FM_BOOTSTRAP_DETECT_ONLY=1 (local detection only, no network, no sweeps)
+
+### 1. Baseline: no config/task-model-presets.json
+exit=0
+  | <silent>
+
+### 2. Valid presets file (the documented canonical schema) -> output must be unchanged from baseline
+exit=0
+RESULT: no new diagnostic line (valid file is silent)
+
+### 3. Same, with FM_BOOTSTRAP_VERBOSE_FACTS=1 -> exactly one added BOOTSTRAP_INFO fact
+exit=0
+added lines vs baseline:
+  + BOOTSTRAP_INFO: task/model presets active config/task-model-presets.json
+
+### 4. Not activated: bootstrap must not publish any dispatch choice
+dispatch-choice records under state/ after 3 bootstrap runs with a valid file: 0
+
+### 5. Malformed file (grok effort max) -> one actionable TASK_MODEL_PRESETS line, bootstrap still exits 0
+exit=0
+added lines vs baseline:
+  + TASK_MODEL_PRESETS: invalid config/task-model-presets.json - preset 'bad' candidate effort 'max' is unsupported for grok
+
+### 6. Malformed JSON -> still one line, reason is the first line only
+exit=0
+  + TASK_MODEL_PRESETS: invalid config/task-model-presets.json - task/model preset config <home>/config/task-model-presets.json is malformed JSON
+
+### 7. node absent from PATH -> MISSING: node exactly once, and NO TASK_MODEL_PRESETS line (no duplicate diagnostic)
+exit=0
+  MISSING: node lines: 1
+  TASK_MODEL_PRESETS lines: 0
+  | MISSING: node (install: brew install node  # or the platform's package manager)

@@ -1,0 +1,80 @@
+$ cat config/task-model-presets.json   # copied verbatim from docs/configuration.md "Task/model presets"
+{
+  "schema_version": 1,
+  "seed": "synthetic-stable-seed",
+  "presets": {
+    "example-fixed": {
+      "description": "replace with a local task category",
+      "mode": "fixed",
+      "candidate": {
+        "id": "fixed-choice",
+        "harness": "pi",
+        "model": "example.invalid/model-fixed",
+        "effort": "high",
+        "fast": false
+      }
+    },
+    "example-weighted": {
+      "mode": "weighted",
+      "candidates": [
+        { "id": "choice-a", "weight": 1, "harness": "grok", "model": "model-a", "effort": "high" },
+        { "id": "choice-b", "weight": 1, "harness": "claude", "model": "opus", "effort": "medium" }
+      ]
+    }
+  }
+}
+
+$ FM_HOME=<isolated-home> bin/fm-task-model-preset.sh validate ; echo "exit=$?"
+exit=0
+
+$ FM_HOME=<isolated-home> bin/fm-task-model-preset.sh select task-fixed-001 example-fixed ; echo "exit=$?"
+{"schema_version":1,"task_id":"task-fixed-001","preset":"example-fixed","config_sha256":"7a75fe31fa45d01af21eb43fe1502a6918db8c4fa9a4580a0db3fb3b8259b0cc","mode":"fixed","algorithm":"fixed-v1","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"fixed-choice","weight":null,"available":true}],"selected":{"id":"fixed-choice","harness":"pi","model":"example.invalid/model-fixed","effort":"high","fast":false}}
+exit=
+
+$ ls -la state/ ; stat -f "%Sp %l %N" state/task-fixed-001.dispatch-choice.json
+total 8
+drwxr-xr-x@ 3 johansardar  staff   96 Sep 14 21:05 .
+drwxr-xr-x@ 4 johansardar  staff  128 Sep 14 21:05 ..
+-rw-------@ 1 johansardar  staff  438 Sep 14 21:05 task-fixed-001.dispatch-choice.json
+-rw------- 1 state/task-fixed-001.dispatch-choice.json
+
+$ cat state/task-fixed-001.dispatch-choice.json | jq .
+{
+  "schema_version": 1,
+  "task_id": "task-fixed-001",
+  "preset": "example-fixed",
+  "config_sha256": "7a75fe31fa45d01af21eb43fe1502a6918db8c4fa9a4580a0db3fb3b8259b0cc",
+  "mode": "fixed",
+  "algorithm": "fixed-v1",
+  "sample_sha256": null,
+  "bucket": null,
+  "total_weight_units": null,
+  "candidates": [
+    {
+      "id": "fixed-choice",
+      "weight": null,
+      "available": true
+    }
+  ],
+  "selected": {
+    "id": "fixed-choice",
+    "harness": "pi",
+    "model": "example.invalid/model-fixed",
+    "effort": "high",
+    "fast": false
+  }
+}
+
+$ cmp <stdout-record> state/task-fixed-001.dispatch-choice.json && echo "stdout record == durable record"
+stdout record == durable record
+
+$ shasum -a 256 config/task-model-presets.json   # must equal record.config_sha256
+7a75fe31fa45d01af21eb43fe1502a6918db8c4fa9a4580a0db3fb3b8259b0cc
+7a75fe31fa45d01af21eb43fe1502a6918db8c4fa9a4580a0db3fb3b8259b0cc
+
+### (addendum) state/ absent before the first select: the selector creates it itself
+$ ls state  -> ls: state: No such file or directory
+select exit=0
+$ stat -f "%Sp %N" state state/fresh-001.dispatch-choice.json
+drwx------ state
+-rw------- state/fresh-001.dispatch-choice.json

@@ -1,0 +1,50 @@
+### 1. Retry reuses the original sample even after the config (seed AND weights) changed
+$ /Users/johansardar/.no-mistakes-dispatch-presets-core-s1/worktrees/fe941e6046e3/01M2HC4W98Y7TXTMX5T9H3Y6GC/bin/fm-task-model-preset.sh select retry-task triage /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/nosub/presets.json
+{"schema_version":1,"task_id":"retry-task","preset":"triage","config_sha256":"b037e0fdaf96f4c9ff0e0c40bc79c609d102e0252eb4790ddb91e2ceed7bd796","mode":"weighted","algorithm":"sha256-bucket-v1","sample_sha256":"6fbf561c890d96a6a7c3722ed3b358c628ccaab322e6ff3c2cddb7ad96e74665","bucket":357465,"total_weight_units":1000000,"candidates":[{"id":"primary","weight":0.4,"available":true},{"id":"alt-a","weight":0.35,"available":true},{"id":"alt-b","weight":0.25,"available":true}],"selected":{"id":"primary","weight":0.4,"harness":"grok","model":"model-primary","effort":"high"}}
+exit=0
+# config now: seed=seed-two, primary weight=100 (would dominate a fresh draw)
+$ /Users/johansardar/.no-mistakes-dispatch-presets-core-s1/worktrees/fe941e6046e3/01M2HC4W98Y7TXTMX5T9H3Y6GC/bin/fm-task-model-preset.sh select retry-task triage /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/nosub/presets-changed.json
+{"schema_version":1,"task_id":"retry-task","preset":"triage","config_sha256":"b037e0fdaf96f4c9ff0e0c40bc79c609d102e0252eb4790ddb91e2ceed7bd796","mode":"weighted","algorithm":"sha256-bucket-v1","sample_sha256":"6fbf561c890d96a6a7c3722ed3b358c628ccaab322e6ff3c2cddb7ad96e74665","bucket":357465,"total_weight_units":1000000,"candidates":[{"id":"primary","weight":0.4,"available":true},{"id":"alt-a","weight":0.35,"available":true},{"id":"alt-b","weight":0.25,"available":true}],"selected":{"id":"primary","weight":0.4,"harness":"grok","model":"model-primary","effort":"high"}}
+exit=0
+RESULT: retry returned the byte-identical original record (config_sha256 still the ORIGINAL config's hash)
+# fresh task id under the changed config DOES see the new config hash:
+$ /Users/johansardar/.no-mistakes-dispatch-presets-core-s1/worktrees/fe941e6046e3/01M2HC4W98Y7TXTMX5T9H3Y6GC/bin/fm-task-model-preset.sh select fresh-task triage /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/nosub/presets-changed.json
+{"schema_version":1,"task_id":"fresh-task","preset":"triage","config_sha256":"fb6ec88fa428586bdfac3fd296541e50ad13d3efc2184b25425dd8822b215bce","mode":"weighted","algorithm":"sha256-bucket-v1","sample_sha256":"88545f4de5f43b657974cd10b850705457314fabe14e0e8e9a511ea899118e9e","bucket":34536963,"total_weight_units":100600000,"candidates":[{"id":"primary","weight":100,"available":true},{"id":"alt-a","weight":0.35,"available":true},{"id":"alt-b","weight":0.25,"available":true}],"selected":{"id":"primary","weight":100,"harness":"grok","model":"model-primary","effort":"high"}}
+exit=0
+original config sha: b037e0fdaf96f4c9ff0e0c40bc79c609d102e0252eb4790ddb91e2ceed7bd796
+changed  config sha: fb6ec88fa428586bdfac3fd296541e50ad13d3efc2184b25425dd8822b215bce
+
+### 2. A sampled unavailable candidate stops the launch (exit 2) and keeps the sample; no fallback
+$ /Users/johansardar/.no-mistakes-dispatch-presets-core-s1/worktrees/fe941e6046e3/01M2HC4W98Y7TXTMX5T9H3Y6GC/bin/fm-task-model-preset.sh select review-task review /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/nosub/pending.json
+error: preset 'review' sampled unavailable candidate 'pending-product': product approval is pending
+exit=2
+# durable record retained with the unavailable sample:
+{"task_id":"review-task","selected":"pending-product","available":false}
+
+### 3. Adversarial: unavailable candidate holds 99.9999% of the weight of a weighted preset.
+#    If the selector renormalized or fell through, most draws would land on the tiny available alternative.
+200 draws: exit2(stopped, unavailable sampled)=200  exit0(available sampled)=0  other=0
+records where bucket fell in the blocked range but another candidate was selected: 0
+sample stderr: error: preset 'heavy' sampled unavailable candidate 'blocked': paid provider not approved
+
+### 4. Availability withdrawn later blocks the retry; later approval enables the SAME recorded choice
+$ /Users/johansardar/.no-mistakes-dispatch-presets-core-s1/worktrees/fe941e6046e3/01M2HC4W98Y7TXTMX5T9H3Y6GC/bin/fm-task-model-preset.sh select avail-task review /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/nosub/avail.json
+{"schema_version":1,"task_id":"avail-task","preset":"review","config_sha256":"251d4451a0a9112f9172447e8860f126d0020bdfef32d9a15ecf6862d828c77e","mode":"fixed","algorithm":"fixed-v1","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"opus-review","weight":null,"available":true}],"selected":{"id":"opus-review","harness":"claude","model":"opus","effort":"medium"}}
+exit=0
+# config flips the already-selected candidate to available:false
+$ /Users/johansardar/.no-mistakes-dispatch-presets-core-s1/worktrees/fe941e6046e3/01M2HC4W98Y7TXTMX5T9H3Y6GC/bin/fm-task-model-preset.sh select avail-task review /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/nosub/avail-off.json
+error: preset 'review' sampled unavailable candidate 'opus-review': approval was withdrawn
+exit=2
+RESULT: durable record untouched by the refusal
+# config flips it back (approval granted)
+$ /Users/johansardar/.no-mistakes-dispatch-presets-core-s1/worktrees/fe941e6046e3/01M2HC4W98Y7TXTMX5T9H3Y6GC/bin/fm-task-model-preset.sh select avail-task review /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/nosub/avail.json
+{"schema_version":1,"task_id":"avail-task","preset":"review","config_sha256":"251d4451a0a9112f9172447e8860f126d0020bdfef32d9a15ecf6862d828c77e","mode":"fixed","algorithm":"fixed-v1","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"opus-review","weight":null,"available":true}],"selected":{"id":"opus-review","harness":"claude","model":"opus","effort":"medium"}}
+exit=0
+RESULT: retry re-enabled with the identical original record
+
+### 5. Swapping the model behind the same candidate id does NOT re-key the recorded choice
+# config now says id=opus-review but model=sonnet
+$ /Users/johansardar/.no-mistakes-dispatch-presets-core-s1/worktrees/fe941e6046e3/01M2HC4W98Y7TXTMX5T9H3Y6GC/bin/fm-task-model-preset.sh select avail-task review /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T//fm-preset-live.sAedpC/nosub/avail-swapped.json
+{"schema_version":1,"task_id":"avail-task","preset":"review","config_sha256":"251d4451a0a9112f9172447e8860f126d0020bdfef32d9a15ecf6862d828c77e","mode":"fixed","algorithm":"fixed-v1","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"opus-review","weight":null,"available":true}],"selected":{"id":"opus-review","harness":"claude","model":"opus","effort":"medium"}}
+exit=0
+record still says model=opus (the sampled model, not the swapped one)

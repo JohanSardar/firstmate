@@ -1,0 +1,56 @@
+### Regression (commit 2e0b4e4): a leftover publication hard link must not block a retry
+$ bin/fm-task-model-preset.sh select link-task example-fixed home/config/task-model-presets.json
+{"schema_version":1,"task_id":"link-task","preset":"example-fixed","config_sha256":"7a75fe31fa45d01af21eb43fe1502a6918db8c4fa9a4580a0db3fb3b8259b0cc","mode":"fixed","algorithm":"fixed-v1","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"fixed-choice","weight":null,"available":true}],"selected":{"id":"fixed-choice","harness":"pi","model":"example.invalid/model-fixed","effort":"high","fast":false}}
+exit=0
+# simulate a selector killed between linkSync(temp, path) and unlinkSync(temp): the temp hard link survives
+$ stat -f '%l' state/link-task.dispatch-choice.json  -> 2 links
+
+# BEFORE the fix (engine from commit db1320a, extracted via git show):
+$ node pre-fix-fm-task-model-preset.mjs select --config ... --state-dir state --task link-task --preset example-fixed
+error: durable preset choice /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T/fm-preset-live.sAedpC/durable/state/link-task.dispatch-choice.json must be a single-link regular file
+exit=1
+
+# AFTER the fix (current bin/fm-task-model-preset.sh):
+$ bin/fm-task-model-preset.sh select link-task example-fixed home/config/task-model-presets.json
+{"schema_version":1,"task_id":"link-task","preset":"example-fixed","config_sha256":"7a75fe31fa45d01af21eb43fe1502a6918db8c4fa9a4580a0db3fb3b8259b0cc","mode":"fixed","algorithm":"fixed-v1","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"fixed-choice","weight":null,"available":true}],"selected":{"id":"fixed-choice","harness":"pi","model":"example.invalid/model-fixed","effort":"high","fast":false}}
+exit=0
+parse error: Invalid numeric literal at line 1, column 6
+
+### Concurrency: two selectors racing on a fresh task id converge on ONE durable record
+exit codes: 0 0
+both selectors returned the identical record
+state dir after race: race-task.dispatch-choice.json 
+link count: 1
+
+### Adversarial durable records are refused rather than silently reused
+# (a) record tampered to a different task id
+$ bin/fm-task-model-preset.sh select t-one example-fixed home/config/task-model-presets.json
+error: durable preset choice /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T/fm-preset-live.sAedpC/durable/tamper/state/t-one.dispatch-choice.json does not match task 't-one' and preset 'example-fixed'
+exit=1
+# (b) record replaced by a symlink
+$ bin/fm-task-model-preset.sh select s-one example-fixed home/config/task-model-presets.json
+error: durable preset choice /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T/fm-preset-live.sAedpC/durable/sym/state/s-one.dispatch-choice.json must be a regular file
+exit=1
+# (c) record is malformed JSON
+$ bin/fm-task-model-preset.sh select b-one example-fixed home/config/task-model-presets.json
+error: cannot reuse durable preset choice /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T/fm-preset-live.sAedpC/durable/bad/state/b-one.dispatch-choice.json: Expected property name or '}' in JSON at position 1 (line 1 column 2)
+exit=1
+# (d) record selected candidate carries an effort the harness cannot launch (grok/xhigh)
+$ bin/fm-task-model-preset.sh select e-one example-fixed home/config/task-model-presets.json
+error: durable preset choice /var/folders/rx/w6wxv0p97bv7hpvzqlv9jy7r0000gn/T/fm-preset-live.sAedpC/durable/eff/state/e-one.dispatch-choice.json selected candidate effort 'xhigh' is unsupported for grok
+exit=1
+# (e) path-traversal task id
+$ bin/fm-task-model-preset.sh select ../escape example-fixed home/config/task-model-presets.json
+error: task id is invalid
+exit=1
+files outside state after traversal attempt: 0 (expect 0)
+# (f) preset name that is not configured
+$ bin/fm-task-model-preset.sh select p-one not-a-preset home/config/task-model-presets.json
+error: task/model preset 'not-a-preset' is not configured
+exit=1
+durable record written for unknown preset: 0 (expect 0)
+
+### (addendum) clean comparison for the leftover-link retry — the earlier parse error line was a driver-script subshell slip, not product output
+$ stat -f %l state/link-task.dispatch-choice.json -> 2 links (leftover temp link still present)
+exit=0
+RESULT: retry beside the leftover publication link reused the byte-identical durable choice

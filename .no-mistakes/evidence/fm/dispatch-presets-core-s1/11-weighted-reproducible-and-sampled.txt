@@ -1,0 +1,24 @@
+# Two separate isolated homes (separate state dirs), same config seed + preset + task id
+$ FM_HOME=homeA bin/fm-task-model-preset.sh select task-weighted-007 example-weighted config/task-model-presets.json
+exit=0
+{"selected":"choice-a","harness":"grok","model":"model-a","effort":"high","bucket":312317,"total_weight_units":2000000,"sample_sha256":"6cf4ccfe04ffde1c8ef32fcba4d61efe7c4ab83d78f178f81afd3bf9bda72bf6","algorithm":"sha256-bucket-v1"}
+$ FM_HOME=homeB bin/fm-task-model-preset.sh select task-weighted-007 example-weighted config/task-model-presets.json
+exit=0
+{"selected":"choice-a","harness":"grok","model":"model-a","effort":"high","bucket":312317,"total_weight_units":2000000,"sample_sha256":"6cf4ccfe04ffde1c8ef32fcba4d61efe7c4ab83d78f178f81afd3bf9bda72bf6","algorithm":"sha256-bucket-v1"}
+RESULT: identical records in both homes (reproducible)
+
+# Independent recomputation of the documented algorithm: sha256(seed NUL preset NUL task), first 13 hex (52 bits) mod sum(weight*1e6)
+seed=synthetic-stable-seed  digest=6cf4ccfe04ffde1c8ef32fcba4d61efe7c4ab83d78f178f81afd3bf9bda72bf6
+sample=1916778672312317 total_weight_units=2000000 bucket=312317
+independently expected selected id: choice-a
+RESULT: selector output matches independent recomputation (auditable)
+
+# Regular sampling: 120 distinct task ids against a 0.4 / 0.35 / 0.25 weighted preset
+  alt-a     47 / 120  (39%)
+  alt-b     27 / 120  (22%)
+  primary   46 / 120  (38%)
+  expected ~ primary 40%, alt-a 35%, alt-b 25%
+durable records published: 120
+
+# Re-running the same 120 ids yields the same 120 choices (reproducible, no resampling)
+RESULT: 120/120 identical on rerun

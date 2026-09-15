@@ -1,0 +1,1 @@
+PASS: task/model presets are deterministic, weighted, explicit on unavailability, and retry-stable
