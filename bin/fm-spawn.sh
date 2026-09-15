@@ -491,6 +491,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
 # shellcheck source=bin/fm-pi-launch-plan-lib.sh
 . "$SCRIPT_DIR/fm-pi-launch-plan-lib.sh"
+# shellcheck source=bin/fm-grok-effort-lib.sh
+. "$SCRIPT_DIR/fm-grok-effort-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -1537,7 +1539,7 @@ pi_supports_tui_mode() {
 }
 
 dispatch_validate_live_settings() {
-  local listing row provider model_id details auth help_text provider_label pi_agent_dir pi_package_dir pi_probe pi_plan_reason
+  local listing row provider model_id details auth help_text provider_label pi_agent_dir pi_package_dir pi_probe pi_plan_reason grok_catalog grok_effort_reason
   [ -n "$DISPATCH_PRESET" ] || return 0
   if [ -n "$DISPATCH_FAST" ] && [ "$HARNESS" != pi ] && [ "$HARNESS" != pi-signed ]; then
     echo "error: preset '$DISPATCH_PRESET' has a Pi fast setting that cannot be carried by relaunch harness '$HARNESS'" >&2
@@ -1582,14 +1584,13 @@ dispatch_validate_live_settings() {
         return 1
       fi
       if [ -n "$DISPATCH_FAST" ]; then
-        # The resolved launch plan is the only fast authority: this spawn
-        # delivers its explicit -e task extension but no --no-extensions, so a
-        # fixed fast value cannot be proven to survive a later discovered
-        # extension's handler and is refused rather than claimed. A launcher
-        # whose plan proves --no-extensions with the task extension last
-        # satisfies the same helper and is allowed.
+        # The resolved launch plan is the only fast authority: it must prove
+        # --no-extensions with this task's request-rewriting extension last, and
+        # the launch below delivers exactly this plan. A plan that cannot prove
+        # the ordering refuses before launch instead of claiming a fast value a
+        # later handler could replace.
         if ! pi_plan_reason=$(fm_pi_fast_plan_guarantees "$STATE/$ID.pi-ext.ts" \
-            -e "$STATE/$ID.pi-ext.ts"); then
+            "${PI_PRESET_PLAN_ARGS[@]+"${PI_PRESET_PLAN_ARGS[@]}"}"); then
           echo "error: preset '$DISPATCH_PRESET' sets fast=$DISPATCH_FAST, but the resolved Pi launch plan cannot guarantee it ($pi_plan_reason); refusing to launch with a fast value it cannot prove" >&2
           return 1
         fi
@@ -1615,6 +1616,20 @@ dispatch_validate_live_settings() {
         return 1
       }
       DISPATCH_TOOL_VERSION=$(grok --version 2>&1 | head -n 1)
+      # Grok's advertised reasoning-effort menu varies by model (installed 1.0.30:
+      # grok-4.6 advertises xhigh, grok-4.5 does not), and `grok models` exposes
+      # only ids, so the requested level is proven against the installed CLI's own
+      # fetched catalog for this exact model instead of a guessed global range. An
+      # unprovable pair refuses before launch rather than recording a control that
+      # may not exist.
+      if [ "$EFFORT" != default ]; then
+        grok_catalog=${GROK_HOME:-$HOME/.grok}/models_cache.json
+        if ! grok_effort_reason=$(fm_grok_effort_evidence "$grok_catalog" \
+            "$DISPATCH_TOOL_VERSION" "$MODEL" "$EFFORT"); then
+          echo "error: preset '$DISPATCH_PRESET' selected Grok effort '$EFFORT' for model '$MODEL', but the installed catalog does not prove it: $grok_effort_reason" >&2
+          return 1
+        fi
+      fi
       ;;
     claude)
       help_text=$(claude --help 2>&1) || {
@@ -1756,12 +1771,16 @@ launch_template() {
         printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       fi
       ;;
+    # __PIPLAN__ is the resolved ordered extension plan (see the preset plan
+    # below): an opt-in preset launch delivers --no-extensions with the task
+    # extension last, while an ordinary launch keeps discovery and the same
+    # single -e shape it has always had.
     pi|pi-signed)
       printf '%s' '__PIBIN____PITUIMODE__'
       if [ "$kind" = secondmate ]; then
         printf '%s' ' __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else
-        printf '%s' ' __MODELFLAG____EFFORTFLAG__-e __PIEXT__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' ' __MODELFLAG____EFFORTFLAG____PIPLAN__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       fi
       ;;
     # omp (Oh My Pi), a Pi fork. Same one-positional-brief, --model, --thinking,
@@ -2033,6 +2052,23 @@ if [ "$EFFORT" = ultra ]; then
 fi
 if [ "$HARNESS" = omp ]; then
   omp_model_validate "$OMP_BIN" "$MODEL" || exit 1
+fi
+# The exact ordered extension plan an opt-in preset Pi launch delivers. Pi runs
+# before_provider_request handlers in extension load order and the last one owns
+# the payload, so a discovered extension could replace this worker's request.
+# A preset launch therefore disables discovery and names its required extension
+# explicitly: the generated task extension carries the busy-state, turn-end, and
+# optional fast-request hooks and is the last extension loaded. The same plan is
+# what fm_pi_fast_plan_guarantees checks below and what launch_template delivers,
+# never two spellings of it (bin/fm-pi-launch-plan-lib.sh owns the contract).
+# Ordinary launches keep Pi's discovery exactly as before.
+PI_PRESET_PLAN_ARGS=()
+if [ -n "$DISPATCH_PRESET" ]; then
+  case "$HARNESS:$KIND" in
+    pi:ship|pi:scout|pi-signed:ship|pi-signed:scout)
+      PI_PRESET_PLAN_ARGS=(--no-extensions -e "$STATE/$ID.pi-ext.ts")
+      ;;
+  esac
 fi
 if [ -n "$DISPATCH_PRESET" ]; then
   dispatch_validate_live_settings || exit 1
@@ -4197,6 +4233,16 @@ fi
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
+# The same order the fast guarantee checked: the preset plan is rendered here
+# only (one owner: PI_PRESET_PLAN_ARGS), so validation and delivery cannot drift.
+sq_piplan="-e $sq_piext"
+if [ "${#PI_PRESET_PLAN_ARGS[@]}" -gt 0 ]; then
+  sq_piplan=
+  for pi_plan_arg in "${PI_PRESET_PLAN_ARGS[@]}"; do
+    sq_piplan="$sq_piplan $(shell_quote "$pi_plan_arg")"
+  done
+  sq_piplan=${sq_piplan# }
+fi
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
 sq_ompext=$(shell_quote "$STATE/$ID.omp-ext.ts")
@@ -4221,6 +4267,7 @@ fi
 LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
 LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
+LAUNCH=${LAUNCH//__PIPLAN__/$sq_piplan}
 LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
 LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
 LAUNCH=${LAUNCH//__OMPEXT__/$sq_ompext}
@@ -4305,6 +4352,18 @@ spawn_record_traceparent() {
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 if [ -n "$DISPATCH_PRESET" ]; then
+  if [ "$RELAUNCH" -eq 1 ] && [ -n "$RELAUNCH_PRIOR_HARNESS" ] && [ "$RELAUNCH_PRIOR_HARNESS" != "$HARNESS" ] \
+     && { [ -e "$STATE_REAL/$ID.dispatch-runtime.json" ] || [ -L "$STATE_REAL/$ID.dispatch-runtime.json" ]; }; then
+    # The prior incarnation's runtime observation (model/effort/session) was
+    # written by the harness this relaunch replaces; reporting it for the new
+    # harness would attribute stale settings to this worker's run. Retire it
+    # before delivery so the finish event reports unknown instead, while the
+    # launch ledger keeps every incarnation's own provenance.
+    if ! rm -f "$STATE_REAL/$ID.dispatch-runtime.json"; then
+      echo "error: could not retire the prior harness's runtime observation for task $ID; refusing to launch a replacement that would inherit stale attribution" >&2
+      exit 1
+    fi
+  fi
   "$SCRIPT_DIR/fm-dispatch-metrics.sh" launch "$STATE/$ID.meta" "$DISPATCH_CHOICE_PATH" || {
     echo "error: preset '$DISPATCH_PRESET' launch metrics could not be recorded; refusing before the worker launch is delivered" >&2
     exit 1

@@ -549,6 +549,61 @@ test_harness_switch_does_not_carry_the_old_profile_axes() {
   pass "fm-control relaunch: a harness switch resets model and effort unless they are named too"
 }
 
+# A preset incarnation's runtime observation names the harness that wrote it.
+# When a relaunch changes harness the file describes the replaced worker, so it
+# must be retired before delivery or the finish event would attribute the old
+# harness's model and effort to the new worker; a same-harness relaunch keeps
+# the observation that still describes the live incarnation.
+test_harness_switch_retires_a_stale_preset_runtime_observation() {
+  local dir out rc id=rl-preset-switch
+  dir=$(new_case preset-switch "$id")
+  add_ship_task "$dir" "$id" pi
+  cat >> "$dir/home/state/$id.meta" <<META
+dispatch_preset=synthetic-fixed
+dispatch_mode=fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_tool_version=pi-test
+META
+  cat > "$dir/home/state/$id.dispatch-choice.json" <<JSON
+{"schema_version":1,"task_id":"$id","preset":"synthetic-fixed","mode":"fixed","algorithm":"fixed-v1","config_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"pi-candidate","weight":null,"available":true}],"selected":{"id":"pi-candidate","harness":"pi","model":"openai-codex/model-pi","effort":"high","fast":false}}
+JSON
+  cat > "$dir/home/state/$id.dispatch-runtime.json" <<JSON
+{"schema_version":1,"task_id":"$id","preset":"synthetic-fixed","session_id":"pi-session","model_used":"openai-codex/model-pi","effort_used":"high","fast_requested":false,"fast_server_verified":false}
+JSON
+  # The replacement harness the operator switches to, with the installed CLI's
+  # own fetched per-model effort catalog.
+  cat > "$dir/fakebin/grok" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  models) printf '%s\n' 'You are logged in with example.invalid.' '' 'Available models:' '  * grok-4.6 (default)' '  - grok-4.5' ;;
+  --version) printf '%s\n' 'grok 9.9.9-test' ;;
+esac
+SH
+  chmod +x "$dir/fakebin/grok"
+  mkdir -p "$dir/grokhome"
+  cat > "$dir/grokhome/models_cache.json" <<'JSON'
+{"fetched_at":"2026-01-01T00:00:00Z","grok_version":"9.9.9-test","auth_method":"session","origin":"https://example.invalid/v1/models","models":{"grok-4.6":{"info":{"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"high"},{"value":"medium"},{"value":"low"}]}}}}
+JSON
+  printf 'grok' > "$dir/fake/becomes"
+
+  out=$(run_control "$dir" "$id" relaunch --harness grok --model grok-4.6 --effort medium --note "switching runtime"); rc=$?
+  expect_code 0 "$rc" "a preset harness switch should succeed"$'\n'"$out"
+  [ "$(meta_field "$dir" "$id" harness)" = grok ] \
+    || fail "the record should follow the preset harness switch"
+  [ ! -e "$dir/home/state/$id.dispatch-runtime.json" ] \
+    || fail "the replaced harness's runtime observation survived the switch and would be reported as the new worker's settings"
+
+  cat > "$dir/home/state/$id.dispatch-runtime.json" <<JSON
+{"schema_version":1,"task_id":"$id","preset":"synthetic-fixed","session_id":"grok-session","model_used":"grok-4.6","effort_used":"medium","fast_requested":null,"fast_server_verified":false}
+JSON
+  out=$(run_control "$dir" "$id" relaunch --note "same runtime"); rc=$?
+  expect_code 0 "$rc" "a same-harness preset relaunch should succeed"$'\n'"$out"
+  [ -e "$dir/home/state/$id.dispatch-runtime.json" ] \
+    || fail "a same-harness relaunch retired the live incarnation's runtime observation"
+  pass "fm-control relaunch: a harness switch retires the stale preset runtime observation and a same-harness relaunch keeps it"
+}
+
 test_harness_switch_resolves_a_prefixed_recorded_harness() {
   local dir out rc auth
   dir=$(new_case prefixcontrol rl32)
@@ -1567,6 +1622,7 @@ test_relaunch_appends_the_progress_note_to_the_instructions
 test_relaunch_requires_a_note_for_a_ship_task
 test_harness_switch_moves_the_record_and_clears_prior_wiring
 test_harness_switch_does_not_carry_the_old_profile_axes
+test_harness_switch_retires_a_stale_preset_runtime_observation
 test_harness_switch_resolves_a_prefixed_recorded_harness
 test_prefixed_recorded_harness_requires_explicit_replacement
 test_same_harness_relaunch_keeps_the_profile_axes

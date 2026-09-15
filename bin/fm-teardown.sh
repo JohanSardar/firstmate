@@ -3203,6 +3203,35 @@ BACKLOG_TRANSITION=$TEARDOWN_BACKLOG_TRANSITION
 BACKLOG_TRANSITION_FLAGS=()
 [ "$BACKLOG_TRANSITION" = close ] || BACKLOG_TRANSITION_FLAGS=(--retain)
 BACKLOG_SKIP_REASON=
+# The preset finish event is durable BEFORE the pending-close record becomes
+# replayable. A later startup replay trusts that record to close the backlog row
+# and retire the sampled choice and runtime observation
+# (bin/fm-backlog-transition-lib.sh owns the replay), so an interrupted cleanup
+# must never be able to erase the only duration/outcome provenance through a
+# marker that has no finish event. This also runs before every destructive step
+# below: a refusal here leaves the endpoint, local copy, and every durable record
+# intact for a retry, and event-id deduplication keeps a retry from appending a
+# second finish event.
+DISPATCH_PRESET=$(fm_meta_get "$META" dispatch_preset)
+if [ -n "$DISPATCH_PRESET" ]; then
+  DISPATCH_CHOICE="$STATE/$ID.dispatch-choice.json"
+  [ -f "$DISPATCH_CHOICE" ] || {
+    echo "error: task $ID records preset '$DISPATCH_PRESET' but its sampled choice is missing; retaining the task record rather than losing comparison provenance" >&2
+    exit 1
+  }
+  if [ "$FORCE" = --force ]; then
+    DISPATCH_OUTCOME=discarded
+  elif [ "$KIND" = scout ]; then
+    DISPATCH_OUTCOME=report-complete
+  else
+    DISPATCH_OUTCOME=landed
+  fi
+  if ! FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
+      "$SCRIPT_DIR/fm-dispatch-metrics.sh" finish "$META" "$DISPATCH_CHOICE" "$DISPATCH_OUTCOME"; then
+    echo "error: task $ID's preset metrics could not be finalized; retaining every durable record rather than recording a pending close with no finish event" >&2
+    exit 1
+  fi
+fi
 if [ "$TEARDOWN_BACKLOG_APPLIES" = 1 ]; then
   backlog_done_args || {
     echo "error: the pending backlog $BACKLOG_TRANSITION for $ID is not replayable; refusing destructive teardown" >&2
@@ -3422,26 +3451,6 @@ if [ "$KIND" != secondmate ]; then
   if ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
       "$SCRIPT_DIR/fm-inactive-reconcile.sh" report "$ID"; then
     echo "error: $ID's final outcome has not reached the parent channel; retaining every durable task record so a rerun can retry the delivery" >&2
-    exit 1
-  fi
-fi
-DISPATCH_PRESET=$(fm_meta_get "$META" dispatch_preset)
-if [ -n "$DISPATCH_PRESET" ]; then
-  DISPATCH_CHOICE="$STATE/$ID.dispatch-choice.json"
-  [ -f "$DISPATCH_CHOICE" ] || {
-    echo "error: task $ID records preset '$DISPATCH_PRESET' but its sampled choice is missing; retaining the task record rather than losing comparison provenance" >&2
-    exit 1
-  }
-  if [ "$FORCE" = --force ]; then
-    DISPATCH_OUTCOME=discarded
-  elif [ "$KIND" = scout ]; then
-    DISPATCH_OUTCOME=report-complete
-  else
-    DISPATCH_OUTCOME=landed
-  fi
-  if ! FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
-      "$SCRIPT_DIR/fm-dispatch-metrics.sh" finish "$META" "$DISPATCH_CHOICE" "$DISPATCH_OUTCOME"; then
-    echo "error: task $ID's preset metrics could not be finalized; retaining the task record rather than losing duration and outcome provenance" >&2
     exit 1
   fi
 fi

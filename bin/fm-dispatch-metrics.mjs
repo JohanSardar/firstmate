@@ -242,9 +242,30 @@ function collectGrok(sessions) {
 function collectRuntime(choicePath, fields, recordedSessions) {
   const runtimePath = choicePath.replace(/\.dispatch-choice\.json$/, ".dispatch-runtime.json");
   if (existsSync(runtimePath)) return readJson(runtimePath, "dispatch runtime observation");
+  // A relaunch may change harness, and a local transcript or session summary
+  // from one harness is not a compatible unit with another's. Dropping the
+  // foreign incarnations would present one harness's total as the task's
+  // complete usage, so nothing is filtered: the observation stays unknown with
+  // the reason, and only a single-harness incarnation set is aggregated.
+  const foreignHarnesses = [...new Set(recordedSessions
+    .filter((entry) => entry.harness !== null && entry.harness !== fields.harness)
+    .map((entry) => entry.harness))];
+  if (foreignHarnesses.length > 0) {
+    const reason = `recorded launch incarnation(s) ran on ${foreignHarnesses.join(", ")} while this launch runs on ${fields.harness}; complete cross-harness usage aggregation is not proven`;
+    return {
+      status: "unknown",
+      basis: "local-launch-ledger",
+      session_id: null,
+      sessions: recordedSessions.map((entry) => ({ session_id: entry.session, harness: entry.harness })),
+      model_used: null,
+      effort_used: null,
+      partial: true,
+      reason,
+      usage: { status: "unknown", kind: "tokens", partial: true, reason },
+    };
+  }
   const ordered = [];
   for (const entry of recordedSessions) {
-    if (entry.harness !== null && entry.harness !== fields.harness) continue;
     if (!ordered.includes(entry.session)) ordered.push(entry.session);
   }
   if (fields.dispatch_runtime_session && !ordered.includes(fields.dispatch_runtime_session)) {

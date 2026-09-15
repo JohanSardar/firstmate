@@ -272,4 +272,87 @@ partial=$(jq -c -s 'map(select(.event=="finish"))[1] | {status: .runtime_observe
 case "$partial" in *'"status":"unknown"'*) ;; *) fail "incomplete relaunch observation was not unknown: $partial" ;; esac
 case "$partial" in *"$session_b"*) ;; *) fail "incomplete relaunch observation did not name the unavailable incarnation: $partial" ;; esac
 
+# A relaunch can change harness, leaving launch-ledger incarnations from more
+# than one harness. Local session stores are not a compatible unit across them,
+# so the finish event must not drop the foreign incarnation and present one
+# harness's total as the task's complete usage: it reports the observation
+# unknown with the reason instead.
+cross_dir="$TMP_ROOT/cross-harness"
+mkdir -p "$cross_dir/data" "$cross_dir/state" "$cross_dir/config/projects/worktree"
+printf '%s\n' '{"schema_version":1,"presets":{"claude-fixed":{"mode":"fixed","candidate":{"id":"opus","harness":"claude","model":"opus","effort":"medium"}}}}' > "$cross_dir/config.json"
+cross_choice=$(FM_STATE_OVERRIDE="$cross_dir/state" "$PRESET" select cross-task claude-fixed "$cross_dir/config.json") || fail "cross-harness choice failed"
+printf '%s\n' "$cross_choice" > "$cross_dir/state/cross-task.dispatch-choice.json"
+write_cross_meta() {  # <harness> <model> <spawn-gen> <runtime-session>
+  cat > "$cross_dir/state/cross-task.meta" <<META
+harness=$1
+kind=ship
+model=$2
+effort=medium
+spawn_gen=$3
+dispatch_preset=claude-fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_runtime_session=$4
+META
+}
+cross_claude=cccccccc-1111-2222-3333-444444444444
+cross_grok=dddddddd-1111-2222-3333-444444444444
+write_cross_meta claude opus s1 "$cross_claude"
+FM_DATA_OVERRIDE="$cross_dir/data" "$METRICS" launch \
+  "$cross_dir/state/cross-task.meta" "$cross_dir/state/cross-task.dispatch-choice.json" || fail "claude incarnation launch metric failed"
+write_cross_meta grok grok-4.6 s2 "$cross_grok"
+FM_DATA_OVERRIDE="$cross_dir/data" "$METRICS" launch \
+  "$cross_dir/state/cross-task.meta" "$cross_dir/state/cross-task.dispatch-choice.json" || fail "grok incarnation launch metric failed"
+# The claude incarnation has a complete local transcript; the grok incarnation
+# has none. Reporting only the claude total would look complete but be partial.
+printf '{"type":"assistant","effort":"medium","message":{"id":"msg_a","model":"claude-opus-5","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5,"output_tokens":30,"output_tokens_details":{"thinking_tokens":7},"speed":"standard","service_tier":"priority"},"content":[{"type":"text"}]}}\n' \
+  > "$cross_dir/config/projects/worktree/$cross_claude.jsonl"
+# Finish on the claude incarnation, whose transcript is complete.
+write_cross_meta claude opus s3 "$cross_claude"
+CLAUDE_CONFIG_DIR="$cross_dir/config" FM_DATA_OVERRIDE="$cross_dir/data" "$METRICS" finish \
+  "$cross_dir/state/cross-task.meta" "$cross_dir/state/cross-task.dispatch-choice.json" landed || fail "cross-harness finish metric failed"
+cross_ledger="$cross_dir/data/dispatch-metrics.jsonl"
+cross_observed=$(jq -c -s 'map(select(.event=="finish"))[0] | {status: .runtime_observed.status, partial: .runtime_observed.partial, model: .runtime_observed.model_used, usage: .usage.status, sessions: [.runtime_observed.sessions[].session_id], reason: .runtime_observed.reason}' "$cross_ledger")
+case "$cross_observed" in *'"status":"unknown"'*) ;; *) fail "cross-harness usage was presented as a complete observation: $cross_observed" ;; esac
+case "$cross_observed" in *'"partial":true'*) ;; *) fail "cross-harness usage was not marked partial: $cross_observed" ;; esac
+case "$cross_observed" in *'"usage":"unknown"'*) ;; *) fail "cross-harness usage was not kept unknown: $cross_observed" ;; esac
+case "$cross_observed" in *'"model":null'*) ;; *) fail "cross-harness finish attributed a model from one harness: $cross_observed" ;; esac
+case "$cross_observed" in *"$cross_claude"*"$cross_grok"*) ;; *) fail "cross-harness finish did not name both incarnations: $cross_observed" ;; esac
+case "$cross_observed" in *"cross-harness"*) ;; *) fail "cross-harness finish did not state the reason: $cross_observed" ;; esac
+
+# A single-harness incarnation set still aggregates exactly as before, so the
+# guard above does not disable ordinary relaunch aggregation.
+same_dir="$TMP_ROOT/same-harness-regression"
+mkdir -p "$same_dir/data" "$same_dir/state" "$same_dir/config/projects/worktree"
+printf '%s\n' '{"schema_version":1,"presets":{"claude-fixed":{"mode":"fixed","candidate":{"id":"opus","harness":"claude","model":"opus","effort":"medium"}}}}' > "$same_dir/config.json"
+same_choice=$(FM_STATE_OVERRIDE="$same_dir/state" "$PRESET" select same-task claude-fixed "$same_dir/config.json") || fail "same-harness choice failed"
+printf '%s\n' "$same_choice" > "$same_dir/state/same-task.dispatch-choice.json"
+write_same_meta() {  # <spawn-gen> <runtime-session>
+  cat > "$same_dir/state/same-task.meta" <<META
+harness=claude
+kind=ship
+model=opus
+effort=medium
+spawn_gen=$1
+dispatch_preset=claude-fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+dispatch_runtime_session=$2
+META
+}
+same_a=aaaaaaaa-1111-2222-3333-444444444401
+same_b=bbbbbbbb-1111-2222-3333-444444444402
+write_same_meta s1 "$same_a"
+FM_DATA_OVERRIDE="$same_dir/data" "$METRICS" launch "$same_dir/state/same-task.meta" "$same_dir/state/same-task.dispatch-choice.json" || fail "same-harness first launch metric failed"
+write_same_meta s2 "$same_b"
+FM_DATA_OVERRIDE="$same_dir/data" "$METRICS" launch "$same_dir/state/same-task.meta" "$same_dir/state/same-task.dispatch-choice.json" || fail "same-harness second launch metric failed"
+printf '{"type":"assistant","effort":"medium","message":{"id":"msg_a","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":30},"content":[{"type":"text"}]}}\n' > "$same_dir/config/projects/worktree/$same_a.jsonl"
+printf '{"type":"assistant","effort":"medium","message":{"id":"msg_b","model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2},"content":[{"type":"text"}]}}\n' > "$same_dir/config/projects/worktree/$same_b.jsonl"
+write_same_meta s3 "$same_b"
+CLAUDE_CONFIG_DIR="$same_dir/config" FM_DATA_OVERRIDE="$same_dir/data" "$METRICS" finish \
+  "$same_dir/state/same-task.meta" "$same_dir/state/same-task.dispatch-choice.json" landed || fail "same-harness finish metric failed"
+same_observed=$(jq -c -s 'map(select(.event=="finish"))[0] | {status: .runtime_observed.status, usage: .usage.status, incarnations: .runtime_observed.usage.incarnations, responses: .runtime_observed.usage.responses, input: .runtime_observed.usage.input_tokens, output: .runtime_observed.usage.output_tokens}' "$same_dir/data/dispatch-metrics.jsonl")
+[ "$same_observed" = '{"status":"observed","usage":"recorded-local","incarnations":2,"responses":2,"input":11,"output":32}' ] \
+  || fail "same-harness relaunch aggregation regressed: $same_observed"
+
 echo "PASS: task/model presets are deterministic, weighted, explicit on unavailability, and conservatively measured"

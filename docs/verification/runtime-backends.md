@@ -1731,6 +1731,21 @@ ok - real Pi SDK 0.85.1 resolves exact thinking levels: a mapped level passes, a
 
 The guard declares a local never-contacted `fm-live-fake` provider with a fully mapped model and a partially mapped model, reads no user credential, and makes no provider call.
 `tests/fm-spawn-task-model-preset.test.sh` pins the same refusal path through a full preset spawn against a fixture package and a synthetic catalog, and `tests/fm-pi-launch-plan.test.sh` owns the separate ordered-launch-plan fast guarantee.
+The preset launch delivers that plan itself: `bin/fm-spawn.sh` builds `--no-extensions -e <state>/<task>.pi-ext.ts` for a preset Pi launch, validates it with `bin/fm-pi-launch-plan-lib.sh`, and delivers the same args, so a fixed `fast` value is launchable and still recorded as requested-only.
+
+## Grok per-model preset reasoning efforts
+
+Verified on 2026-09-15 with the installed `grok` 1.0.30 on macOS 26.5.2 arm64, read-only and token-free.
+The CLI's own fetched catalog at `$GROK_HOME/models_cache.json` (here `~/.grok/models_cache.json`, written by `grok models` from its authenticated models endpoint) advertises a different reasoning-effort menu per model:
+
+```text
+~/.grok/models_cache.json: grok-4.6  supports_reasoning_effort=true  menu=xhigh,high,medium,low
+~/.grok/models_cache.json: grok-4.5  supports_reasoning_effort=true  menu=high,medium,low
+```
+
+`bin/fm-grok-effort-lib.sh` proves an opt-in preset's requested level against exactly that menu plus the catalog's `grok_version` stamp, so `grok-4.6` at `xhigh` launches while `grok-4.5` at `xhigh`, `max` on either model, a catalog written by another grok version, and a missing catalog all refuse before launch.
+No grok session or provider request is made by the check; it reads the CLI's own catalog file.
+`tests/fm-grok-effort-lib.test.sh` covers the verdicts from catalog fixtures, and `tests/fm-spawn-task-model-preset.test.sh` covers the same refusals and the accepted pair through a full preset spawn.
 
 ## Oh My Pi (omp)
 

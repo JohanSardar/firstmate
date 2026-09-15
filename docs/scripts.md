@@ -111,6 +111,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-task-model-preset.mjs` | The JSON validation and selection engine behind `fm-task-model-preset.sh` |
 | `fm-pi-reasoning-probe.mjs` | Prove an opt-in preset's exact Pi thinking level against the installed package's own model catalog before launch |
 | `fm-pi-launch-plan-lib.sh` | Pure owner of the resolved Pi launch-plan fast guarantee (`--no-extensions` with the task extension last) |
+| `fm-grok-effort-lib.sh`  | Prove an opt-in preset's Grok reasoning effort against the selected model's own advertised menu in the installed CLI's fetched catalog |
 | `fm-dispatch-metrics.sh` | Append preset launch, finish, and later observation events to the private `data/dispatch-metrics.jsonl` comparison ledger |
 | `fm-vendor-auth-probe.sh`| Run one hard-bounded, non-destructive authentication probe of a named vendor CLI and report the fact |
 | `fm-wake-drain.sh`       | Present and acknowledge the current actor's claimed wake rows alongside status, outcome-backstop, decision, divergence, recovery, and supervision checks |

@@ -117,6 +117,18 @@ SH
   chmod +x "$fakebin/grok"
 }
 
+# Synthetic stand-in for the CLI's own fetched model catalog. The real grok
+# writes <GROK_HOME>/models_cache.json from its authenticated models endpoint
+# and stamps it with the fetching version; the launch validation proves the
+# requested effort against that per-model menu.
+write_fake_grok_catalog() {  # <home> <version> <models-json>
+  local home=$1 version=$2 models=$3
+  mkdir -p "$home/user-home/.grok"
+  cat > "$home/user-home/.grok/models_cache.json" <<JSON
+{"fetched_at":"2026-01-01T00:00:00Z","grok_version":"$version","auth_method":"session","origin":"https://example.invalid/v1/models","models":$models}
+JSON
+}
+
 install_fake_claude() {
   local fakebin=$1
   cat > "$fakebin/claude" <<'SH'
@@ -235,29 +247,98 @@ assert_contains "$out" "could not verify exact Pi reasoning support" "missing-pa
 assert_contains "$out" "installed Pi package not found" "missing-package probe detail"
 [ ! -s "$DIR/launch.log" ] || fail "missing-package refusal still delivered a launch"
 
-# The resolved launch plan is the only fast authority. This spawn delivers its
-# task extension with -e but no --no-extensions, so a fixed fast value cannot be
-# proven to survive a later discovered handler and is refused before launch.
-record=$(make_case pi-fast pi-fast-task pi openai-codex/model-pi max false)
+# A fixed fast value is guaranteed only through the deterministic preset plan:
+# the launch disables discovery and names the task extension last, so the
+# generated provider-request handler is the final request rewriter. The launch
+# must deliver exactly that plan, and the ledger still records fast as
+# requested-only, never wire-verified.
+record=$(make_case pi-fast pi-fast-task pi openai-codex/model-pi max true)
 IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
 $record
 EOF
 install_fake_pi "$FAKEBIN_DIR"
 out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-fast-task "$PROJ_DIR" "$DIR/launch.log") \
-  && fail "a fixed fast preset launched without a plan that proves the task extension wins"
-assert_contains "$out" "cannot guarantee it (missing --no-extensions)" "fast plan refusal reason"
-assert_contains "$out" "refusing to launch with a fast value it cannot prove" "fast plan refusal wording"
-[ ! -s "$DIR/launch.log" ] || fail "fast plan refusal still delivered a launch"
+  || fail "Pi fast preset spawn failed: $out"
+launch=$(cat "$DIR/launch.log")
+assert_contains "$launch" "--no-extensions" "fast preset launch disables discovery"
+case "$launch" in
+  *"'--no-extensions' '-e' '"$HOME_DIR/state/pi-fast-task.pi-ext.ts"'"*) ;;
+  *) fail "the fast preset launch did not deliver --no-extensions before the task extension: $launch" ;;
+esac
+fast_extension="'-e' '$HOME_DIR/state/pi-fast-task.pi-ext.ts'"
+after_extension=${launch#*"$fast_extension"}
+case "$after_extension" in
+  *"'-e' "*) fail "a later extension followed the task extension in the fast launch: $launch" ;;
+esac
+cat > "$DIR/assert-pi-fast-extension.mjs" <<'JS'
+import { pathToFileURL } from "node:url";
+const callbacks = new Map();
+const pi = {
+  on(name, callback) {
+    if (!callbacks.has(name)) callbacks.set(name, []);
+    callbacks.get(name).push(callback);
+  },
+};
+const extension = await import(pathToFileURL(process.argv[2]).href);
+extension.default(pi);
+const handlers = callbacks.get("before_provider_request") || [];
+if (handlers.length !== 1) throw new Error(`expected one provider-request handler, got ${handlers.length}`);
+const rewritten = handlers[0]({ payload: { model: "gpt-5" } }, { model: { provider: "openai-codex", api: "openai-codex-responses" } });
+if (rewritten.service_tier !== "priority") throw new Error(`fast request did not set priority: ${JSON.stringify(rewritten)}`);
+const untouched = handlers[0]({ payload: { model: "other" } }, { model: { provider: "anthropic", api: "anthropic-messages" } });
+if (untouched !== undefined) throw new Error("fast request rewrote a non-codex provider payload");
+JS
+node --no-warnings "$DIR/assert-pi-fast-extension.mjs" "$HOME_DIR/state/pi-fast-task.pi-ext.ts" \
+  || fail "the delivered fast task extension did not register its provider-request handler"
+metrics="$HOME_DIR/data/dispatch-metrics.jsonl"
+[ "$(jq -s -r 'map(select(.event=="launch-prepared"))[0].effective.fast' "$metrics")" = null ] \
+  || fail "a requested fast value was claimed as effective"
+[ "$(jq -s -r 'map(select(.event=="launch-prepared"))[0].effective.fast_basis' "$metrics")" = requested-not-wire-verified ] \
+  || fail "the fast value was not recorded as requested-only"
+
+# The pure plan helper still owns the refusal fixture: a plan that appends a
+# later rewriter after the task extension refuses before launch
+# (tests/fm-pi-launch-plan.test.sh), and a preset launch whose resolved plan
+# cannot prove the ordering is refused by the same call.
 
 record=$(make_case grok grok-preset-task grok grok-example xhigh)
 IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
 $record
 EOF
 install_fake_grok "$FAKEBIN_DIR"
+write_fake_grok_catalog "$HOME_DIR" 9.9.9-test '{"grok-example":{"info":{"supports_reasoning_effort":true,"reasoning_effort":"high","reasoning_efforts":[{"id":"xhigh","value":"xhigh"},{"id":"high","value":"high"},{"id":"medium","value":"medium"},{"id":"low","value":"low"}]}}}'
 out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" grok-preset-task "$PROJ_DIR" "$DIR/launch.log") || fail "Grok preset spawn failed: $out"
 launch=$(cat "$DIR/launch.log")
 assert_contains "$launch" "--session-id '" "Grok session identity"
 assert_contains "$launch" "--model 'grok-example' --reasoning-effort 'xhigh'" "Grok xhigh launch setting"
+
+# The advertised effort menu varies by model, so a level the selected model
+# does not advertise refuses before launch rather than being recorded as
+# validated control (installed 1.0.30: grok-4.6 advertises xhigh, grok-4.5 does
+# not).
+record=$(make_case grok-effort-refused grok-effort-task grok grok-example xhigh)
+IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
+$record
+EOF
+install_fake_grok "$FAKEBIN_DIR"
+write_fake_grok_catalog "$HOME_DIR" 9.9.9-test '{"grok-example":{"info":{"supports_reasoning_effort":true,"reasoning_efforts":[{"id":"high","value":"high"},{"id":"medium","value":"medium"},{"id":"low","value":"low"}]}}}'
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" grok-effort-task "$PROJ_DIR" "$DIR/launch.log") \
+  && fail "a Grok preset launched an effort the selected model does not advertise"
+assert_contains "$out" "does not advertise reasoning effort 'xhigh'" "Grok per-model effort refusal"
+assert_contains "$out" "advertised: high,medium,low" "Grok advertised effort menu"
+[ ! -s "$DIR/launch.log" ] || fail "the Grok effort refusal still delivered a launch"
+
+# Without the CLI's own fetched catalog nothing proves the pair, so the launch
+# refuses instead of falling back to a guessed global effort range.
+record=$(make_case grok-no-catalog grok-no-catalog-task grok grok-example xhigh)
+IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
+$record
+EOF
+install_fake_grok "$FAKEBIN_DIR"
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" grok-no-catalog-task "$PROJ_DIR" "$DIR/launch.log") \
+  && fail "a Grok preset launched without the catalog that proves its effort"
+assert_contains "$out" "no fetched Grok model catalog" "Grok missing-catalog refusal"
+[ ! -s "$DIR/launch.log" ] || fail "the Grok missing-catalog refusal still delivered a launch"
 
 record=$(make_case claude claude-preset-task claude opus medium)
 IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF

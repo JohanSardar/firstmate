@@ -761,6 +761,64 @@ SH
   pass "preset metrics finish once and retain sampled provenance until the task record closes"
 }
 
+# A pending-close record is what a later startup replay trusts to close the
+# backlog row and retire the sampled choice and runtime observation. It must
+# therefore never become replayable before the finish event is durable: a
+# cleanup interrupted after the marker would otherwise erase the only duration
+# and outcome provenance. A finish that cannot be persisted refuses before the
+# marker is written and before any destructive step.
+test_preset_finish_is_durable_before_the_pending_close_record() {
+  local case_dir out rc
+  case_dir=$(make_case preset-finish-order)
+  write_meta "$case_dir" local-only ship
+  cat >> "$case_dir/state/task-x1.meta" <<META
+harness=claude
+model=opus
+effort=medium
+dispatch_preset=synthetic-fixed
+dispatch_mode=fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=$(date +%s)
+META
+  cat > "$case_dir/state/task-x1.dispatch-choice.json" <<'JSON'
+{"schema_version":1,"task_id":"task-x1","preset":"synthetic-fixed","mode":"fixed","algorithm":"fixed-v1","candidates":[{"id":"fixed","weight":null,"available":true}],"selected":{"id":"fixed","harness":"claude","model":"opus","effort":"medium"}}
+JSON
+  cat > "$case_dir/state/task-x1.dispatch-runtime.json" <<'JSON'
+{"schema_version":1,"task_id":"task-x1","preset":"synthetic-fixed","model_used":"claude-opus-5","effort_used":"medium","fast_requested":null,"fast_server_verified":false}
+JSON
+  wt_commit "$case_dir" "profiled fix"
+  add_fork_with_pushed_branch "$case_dir"
+
+  # A malformed ledger line makes the finish event impossible to append.
+  printf '%s\n' '{not json' > "$case_dir/data/dispatch-metrics.jsonl"
+  set +e
+  out=$(run_teardown "$case_dir" 2>&1)
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "an unpersistable preset finish must refuse"$'\n'"$out"
+  assert_contains "$out" "preset metrics could not be finalized" \
+    "the refusal must name the unpersisted finish event"
+  assert_absent "$case_dir/state/task-x1.backlog-close" \
+    "a replayable pending-close record was written before the finish event existed"
+  assert_present "$case_dir/state/task-x1.meta" "the refused finish removed the task record"
+  assert_present "$case_dir/state/task-x1.dispatch-choice.json" \
+    "the refused finish removed the sampled choice"
+  assert_present "$case_dir/state/task-x1.dispatch-runtime.json" \
+    "the refused finish removed the runtime observation"
+  assert_present "$case_dir/wt" "the refused finish still ran a destructive worktree step"
+
+  # With the ledger repaired, the retry persists exactly one finish event and
+  # then completes the pending close.
+  : > "$case_dir/data/dispatch-metrics.jsonl"
+  run_teardown "$case_dir" >/dev/null 2>&1 || fail "the repaired retry did not complete"
+  assert_absent "$case_dir/state/task-x1.backlog-close" "the retry left its pending-close record"
+  assert_absent "$case_dir/state/task-x1.dispatch-choice.json" \
+    "the completed close retained the sampled choice"
+  jq -s -e 'map(select(.event == "finish")) | length == 1' "$case_dir/data/dispatch-metrics.jsonl" >/dev/null \
+    || fail "the retry did not persist exactly one finish event"
+  pass "a preset finish event is durable before the pending close can be replayed"
+}
+
 test_teardown_closes_the_backlog_item_itself() {
   local case_dir out
   case_dir=$(make_case tasks-axi-close)
@@ -3725,6 +3783,7 @@ EOF
 
 test_local_only_fork_remote_allows
 test_preset_metrics_finish_waits_for_task_record_close
+test_preset_finish_is_durable_before_the_pending_close_record
 test_teardown_closes_the_backlog_item_itself
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator
 test_local_only_truly_unpushed_refuses
