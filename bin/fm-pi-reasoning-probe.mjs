@@ -10,6 +10,12 @@
 // tests/fm-pi-branch-live-e2e.test.sh pins. fm-spawn refuses a preset whose
 // exact level the probe cannot prove.
 //
+// The probe is FORCED offline, never asserted offline: Pi's ModelRuntime.refresh
+// defaults allowNetwork to its PI_OFFLINE-controlled flag, so the process sets
+// PI_OFFLINE=1 and passes allowNetwork:false explicitly. Catalog resolution is
+// therefore a read of the installed package and the agent dir only, and a launch
+// refusal can never depend on a catalog fetch.
+//
 // Usage:
 //   fm-pi-reasoning-probe.mjs --package-dir <dir> --agent-dir <dir> \
 //     --model <provider/id> --effort <level>
@@ -20,6 +26,11 @@
 
 import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+
+// Pin the package's own offline switch before any runtime is created, so a
+// future default change in the package cannot turn this probe into a network
+// client behind the caller's back.
+process.env.PI_OFFLINE = "1";
 
 function fail(message, code) {
   process.stderr.write(`error: ${message}\n`);
@@ -76,7 +87,7 @@ try {
     modelsPath: `${agentDir}/models.json`,
   });
   registry = new ModelRegistry(runtime);
-  await registry.refresh();
+  await registry.refresh({ allowNetwork: false });
 } catch (error) {
   fail(`cannot resolve Pi's model catalog from ${agentDir}: ${error.message}`, 4);
 }

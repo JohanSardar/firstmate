@@ -46,12 +46,15 @@
 #              inherits the local copy but none of the conversation; a
 #              secondmate reconciles its own home's records at startup, so its
 #              standing charter is never rewritten.
-#              Records a durable checkpoint and that note, exits the old agent,
-#              then delegates the launch to its single owner,
-#              bin/fm-spawn.sh --relaunch. A failure before publication keeps
-#              the prior durable record in place and reports the concrete
-#              state; it never leaves a half-transitioned task claiming to be
-#              running.
+#              Records a durable checkpoint and that note, then validates the
+#              replacement profile through bin/fm-spawn.sh --preflight BEFORE
+#              the old agent is stopped, so an unusable harness/model/effort
+#              pair or missing credential leaves the running agent untouched.
+#              Only then does it exit the old agent and delegate the launch to
+#              the same owner, bin/fm-spawn.sh --relaunch. A failure before
+#              publication keeps the prior durable record in place and reports
+#              the concrete state; it never leaves a half-transitioned task
+#              claiming to be running.
 #
 # Teardown and discard are NOT verbs here and never will be. `exit` stops an
 # agent and preserves everything else; removing a worktree, killing an
@@ -816,6 +819,25 @@ do_relaunch() {
   else
     note_line="note=none"
   fi
+  spawn_args=("$ID" --relaunch --harness "$TARGET_HARNESS")
+  [ "$TARGET_MODEL" = default ] || spawn_args+=(--model "$TARGET_MODEL")
+  [ "$TARGET_EFFORT" = default ] || spawn_args+=(--effort "$TARGET_EFFORT")
+  # Validate the replacement profile BEFORE the old agent is stopped. For a
+  # preset task the launch owner resolves the sampled candidate (or the explicit
+  # override) and refuses an unusable harness/model/effort pair or a missing
+  # credential; running that same resolution in check mode here keeps a bad
+  # replacement from leaving the task with no agent at all. The check writes to
+  # a file rather than command substitution on purpose: fm-spawn recognizes the
+  # control-lock holder by its parent pid, and a command-substitution subshell
+  # would break that identity and be refused as a concurrent lifecycle action.
+  PREFLIGHT_OUT="$JOURNAL.preflight"
+  if "$SCRIPT_DIR/fm-spawn.sh" "${spawn_args[@]}" --preflight >"$PREFLIGHT_OUT" 2>&1; then
+    rm -f "$PREFLIGHT_OUT"
+  else
+    preflight_output=$(cat "$PREFLIGHT_OUT" 2>/dev/null)
+    rm -f "$PREFLIGHT_OUT"
+    die "replacement profile for $ID was refused before stopping its agent: $preflight_output"
+  fi
   safe_checkpoint
   cp -p "$META" "$META_PRIOR" || die "could not preserve task $ID's durable record before relaunching"
   RELAUNCH_ACTIVE=1
@@ -832,9 +854,6 @@ do_relaunch() {
   # per-task harness wiring before arming the new one, so nothing to do here.
   RELAUNCH_TX="${BASHPID:-$$}.$(date -u +%Y%m%dT%H%M%SZ).$RANDOM"
   journal_write launching "${CHECKPOINT_LINES[@]}" "$note_line" "relaunch_tx=$RELAUNCH_TX"
-  spawn_args=("$ID" --relaunch --harness "$TARGET_HARNESS")
-  [ "$TARGET_MODEL" = default ] || spawn_args+=(--model "$TARGET_MODEL")
-  [ "$TARGET_EFFORT" = default ] || spawn_args+=(--effort "$TARGET_EFFORT")
   if FM_CONTROL_RELAUNCH_TX="$RELAUNCH_TX" \
       "$SCRIPT_DIR/fm-spawn.sh" "${spawn_args[@]}" >/dev/null; then
     RELAUNCH_META_PUBLISHED=1

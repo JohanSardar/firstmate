@@ -604,6 +604,67 @@ JSON
   pass "fm-control relaunch: a harness switch retires the stale preset runtime observation and a same-harness relaunch keeps it"
 }
 
+# A preset task switched onto a different harness must not replay the sampled
+# model/effort axes (or the Pi-only fast request) onto the replacement. The
+# profile resolution resets them before the stop and validates the result, so
+# the relaunch succeeds on the new harness's own defaults.
+test_harness_switch_resets_a_preset_sampled_profile_before_stop() {
+  local dir out rc id=rl-preset-defaults
+  dir=$(new_case preset-defaults "$id")
+  add_ship_task "$dir" "$id" pi
+  sed 's/^model=default$/model=openai-codex\/model-pi/; s/^effort=default$/effort=max/' \
+    "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.tmp"
+  mv "$dir/home/state/$id.meta.tmp" "$dir/home/state/$id.meta"
+  cat >> "$dir/home/state/$id.meta" <<META
+dispatch_preset=synthetic-fixed
+dispatch_mode=fixed
+dispatch_fast=on
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+META
+  cat > "$dir/home/state/$id.dispatch-choice.json" <<JSON
+{"schema_version":1,"task_id":"$id","preset":"synthetic-fixed","mode":"fixed","algorithm":"fixed-v1","config_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sample_sha256":null,"bucket":null,"total_weight_units":null,"candidates":[{"id":"pi-candidate","weight":null,"available":true}],"selected":{"id":"pi-candidate","harness":"pi","model":"openai-codex/model-pi","effort":"max","fast":true}}
+JSON
+  printf 'grok' > "$dir/fake/becomes"
+  out=$(run_control "$dir" "$id" relaunch --harness grok --note "switching runtime"); rc=$?
+  expect_code 0 "$rc" "a preset harness switch without explicit axes should succeed"$'\n'"$out"
+  [ "$(meta_field "$dir" "$id" harness)" = grok ] || fail "the record should follow the preset harness switch"
+  [ "$(meta_field "$dir" "$id" model)" = default ] || fail "the sampled model must not be replayed onto a different harness"
+  [ "$(meta_field "$dir" "$id" effort)" = default ] || fail "the sampled effort must not be replayed onto a different harness"
+  [ -z "$(meta_field "$dir" "$id" dispatch_fast)" ] || fail "the Pi-only fast request must not be carried onto a different harness"
+  assert_grep "grok --always-approve" "$dir/fake/literal" "the replacement launch should be the new harness"
+  if grep -q 'openai-codex/model-pi' "$dir/fake/literal"; then
+    fail "the replacement launch replayed the sampled Pi model"
+  fi
+  if grep -q -- '--thinking' "$dir/fake/literal"; then
+    fail "the replacement launch replayed the sampled Pi thinking level"
+  fi
+  pass "fm-control relaunch: a preset harness switch resets the sampled axes and drops the Pi-only fast request"
+}
+
+# The preflight is what keeps a bad replacement from leaving the task with no
+# agent: when the launch owner refuses the replacement profile, fm-control must
+# refuse BEFORE the old agent is stopped, and nothing may reach the endpoint.
+test_preset_relaunch_refuses_an_unlaunchable_replacement_before_stop() {
+  local dir out rc id=rl-preset-refuse
+  dir=$(new_case preset-refuse "$id")
+  add_ship_task "$dir" "$id" pi
+  cat >> "$dir/home/state/$id.meta" <<META
+dispatch_preset=synthetic-fixed
+dispatch_mode=fixed
+dispatch_started_at=2026-01-01T00:00:00Z
+dispatch_started_epoch=1
+META
+  printf 'grok' > "$dir/fake/becomes"
+  out=$(run_control "$dir" "$id" relaunch --harness grok --note "switching runtime"); rc=$?
+  expect_code 1 "$rc" "a preset relaunch without its durable choice should refuse"$'\n'"$out"
+  assert_contains "$out" "refused before stopping its agent" "the refusal should name the pre-stop validation"
+  [ -z "$(cat "$dir/fake/literal")" ] || fail "a refused preflight must send nothing to the endpoint"
+  [ "$(cat "$dir/fake/command")" = claude ] || fail "a refused preflight must leave the old agent running"
+  [ ! -e "$dir/home/state/$id.control-relaunch" ] || fail "a refused preflight must not begin a relaunch transaction"
+  pass "fm-control relaunch: an unlaunchable preset replacement refuses before the old agent is stopped"
+}
+
 test_harness_switch_resolves_a_prefixed_recorded_harness() {
   local dir out rc auth
   dir=$(new_case prefixcontrol rl32)
@@ -1622,6 +1683,8 @@ test_relaunch_appends_the_progress_note_to_the_instructions
 test_relaunch_requires_a_note_for_a_ship_task
 test_harness_switch_moves_the_record_and_clears_prior_wiring
 test_harness_switch_does_not_carry_the_old_profile_axes
+test_harness_switch_resets_a_preset_sampled_profile_before_stop
+test_preset_relaunch_refuses_an_unlaunchable_replacement_before_stop
 test_harness_switch_retires_a_stale_preset_runtime_observation
 test_harness_switch_resolves_a_prefixed_recorded_harness
 test_prefixed_recorded_harness_requires_explicit_replacement

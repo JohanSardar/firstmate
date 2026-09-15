@@ -4,7 +4,10 @@
 # local models with different thinkingLevelMap shapes and proves the production
 # probe accepts a mapped level, refuses an unmapped one, and refuses an unknown
 # model. No provider call leaves the machine: the synthetic provider carries a
-# placeholder key and is never contacted, and catalog resolution stays local.
+# placeholder key and is never contacted, and the probe forces its own catalog
+# resolution offline (PI_OFFLINE=1 plus allowNetwork:false). The guard below
+# blocks every TCP connect in the probe process, so an accidental catalog fetch
+# fails loudly instead of quietly succeeding over the network.
 #
 # Run after every Pi upgrade and before trusting refreshed per-harness evidence
 # (docs/verification/runtime-backends.md).
@@ -65,12 +68,27 @@ JSON
 
 probe="$ROOT/bin/fm-pi-reasoning-probe.mjs"
 
-out=$(node "$probe" --package-dir "$PI_PACKAGE_DIR" --agent-dir "$agentdir" \
+# Any successful or attempted TCP connection from the probe is a network use the
+# probe claims not to make; the preload turns one into a loud failure.
+cat > "$TMP_ROOT/block-network.cjs" <<'JS'
+const net = require("node:net");
+const tls = require("node:tls");
+const blocked = () => {
+  throw new Error("network access is blocked by the fm-pi-reasoning-probe live guard");
+};
+net.Socket.prototype.connect = blocked;
+net.connect = blocked;
+net.createConnection = blocked;
+tls.connect = blocked;
+JS
+probe_env=(NODE_OPTIONS="--require $TMP_ROOT/block-network.cjs")
+
+out=$(env "${probe_env[@]}" node "$probe" --package-dir "$PI_PACKAGE_DIR" --agent-dir "$agentdir" \
   --model fm-live-fake/fm-live-deep --effort max 2>&1) || fail "the probe refused a mapped level: $out"
 [ "$out" = "supported=off,minimal,low,medium,high,xhigh,max" ] \
   || fail "the real Pi SDK reported an unexpected supported-level list: $out"
 
-out=$(node "$probe" --package-dir "$PI_PACKAGE_DIR" --agent-dir "$agentdir" \
+out=$(env "${probe_env[@]}" node "$probe" --package-dir "$PI_PACKAGE_DIR" --agent-dir "$agentdir" \
   --model fm-live-fake/fm-live-shallow --effort max 2>&1)
 status=$?
 [ "$status" -eq 3 ] || fail "the probe did not refuse an unmapped level (exit $status): $out"
@@ -79,7 +97,7 @@ case "$out" in
   *) fail "the unmapped-level refusal did not name the level: $out" ;;
 esac
 
-out=$(node "$probe" --package-dir "$PI_PACKAGE_DIR" --agent-dir "$agentdir" \
+out=$(env "${probe_env[@]}" node "$probe" --package-dir "$PI_PACKAGE_DIR" --agent-dir "$agentdir" \
   --model fm-live-fake/fm-live-absent --effort high 2>&1)
 status=$?
 [ "$status" -eq 2 ] || fail "the probe did not refuse an unknown model (exit $status): $out"

@@ -180,6 +180,13 @@ install_fake_pi "$FAKEBIN_DIR"
 out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-preset-task "$PROJ_DIR" "$DIR/launch.log") || fail "Pi preset spawn failed: $out"
 launch=$(cat "$DIR/launch.log")
 assert_contains "$launch" "--model 'openai-codex/model-pi' --thinking 'max'" "Pi launch settings"
+# A preset without a fixed fast value keeps Pi's ordinary discovery and the
+# same single -e shape every other launch uses: the ordered --no-extensions
+# plan is reserved for the case where a fast value must be guaranteed.
+case "$launch" in
+  *"--no-extensions"*) fail "a preset without fixed fast disabled Pi extension discovery: $launch" ;;
+esac
+assert_contains "$launch" "-e '$HOME_DIR/state/pi-preset-task.pi-ext.ts'" "ordinary preset keeps the task extension"
 # The generated Pi extension registers the provider-request hook exactly once
 # when the file loads, never per session_start, so a re-fired session start
 # cannot stack duplicate handlers.
@@ -357,7 +364,22 @@ EOF
 install_fake_opencode "$FAKEBIN_DIR"
 out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" opencode-preset-task "$PROJ_DIR" "$DIR/launch.log") || fail "OpenCode preset spawn failed: $out"
 launch=$(cat "$DIR/launch.log")
-assert_contains "$launch" "opencode run --interactive --auto --model 'vendor/model-open' --variant 'xhigh'" "OpenCode variant launch"
+# The installed `opencode run` subcommand is one-shot, so the preset must launch
+# the long-lived TUI with a per-launch agent carrying the exact model/variant.
+case "$launch" in
+  *"opencode run "*) fail "OpenCode preset launched the one-shot run subcommand: $launch" ;;
+esac
+assert_contains "$launch" "opencode --agent fm-preset-opencode-preset-task --auto --model 'vendor/model-open' --prompt" "OpenCode persistent TUI launch"
+oc_config=$(printf '%s\n' "$launch" | sed -n "s/^.*OPENCODE_CONFIG_CONTENT='\([^']*\)'.*$/\1/p" | head -1)
+[ -n "$oc_config" ] || fail "OpenCode preset launch did not carry an OPENCODE_CONFIG_CONTENT"
+[ "$(printf '%s' "$oc_config" | jq -r '.permission["*"]')" = allow ] \
+  || fail "OpenCode preset config lost its permission posture"
+[ "$(printf '%s' "$oc_config" | jq -r '.agent["fm-preset-opencode-preset-task"].mode')" = primary ] \
+  || fail "OpenCode preset agent is not a primary agent"
+[ "$(printf '%s' "$oc_config" | jq -r '.agent["fm-preset-opencode-preset-task"].model')" = vendor/model-open ] \
+  || fail "OpenCode preset agent lost the exact model"
+[ "$(printf '%s' "$oc_config" | jq -r '.agent["fm-preset-opencode-preset-task"].variant')" = xhigh ] \
+  || fail "OpenCode preset agent lost the exact variant"
 cat > "$DIR/assert-opencode-runtime.mjs" <<'JS'
 import { pathToFileURL } from "node:url";
 const plugin = await import(pathToFileURL(process.argv[2]).href);
@@ -386,5 +408,46 @@ out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" opencode-noauth-task "$PROJ_
   && fail "OpenCode preset launched without a matching credential"
 assert_contains "$out" "has no matching credential" "OpenCode credential refusal"
 [ ! -s "$DIR/launch.log" ] || fail "credential refusal still delivered a launch"
+
+# A harness switch on a preset task used to replay the sampled model/effort and
+# the Pi-only fast value onto the replacement harness, and it only refused after
+# the old agent had already been stopped. --preflight is the same profile
+# resolution the launch runs, on the pre-stop side: a different harness resets
+# the sampled axes (and drops the Pi-only fast request), an explicit override is
+# preserved and validated, and nothing durable changes either way.
+record=$(make_case pi-switch pi-switch-task pi openai-codex/model-pi max true)
+IFS='|' read -r DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
+$record
+EOF
+install_fake_pi "$FAKEBIN_DIR"
+install_fake_grok "$FAKEBIN_DIR"
+out=$(run_case "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-switch-task "$PROJ_DIR" "$DIR/launch.log") \
+  || fail "Pi fast preset spawn for relaunch failed: $out"
+meta_before=$(cat "$HOME_DIR/state/pi-switch-task.meta")
+out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-switch-task --relaunch --harness grok --preflight 2>&1) \
+  || fail "harness-switch preflight did not resolve the default replacement profile: $out"
+assert_contains "$out" "profile-validated harness=grok model=default effort=default" "harness-switch preflight profile"
+[ "$(cat "$HOME_DIR/state/pi-switch-task.meta")" = "$meta_before" ] || fail "preflight rewrote the task record"
+# The same harness keeps the sampled candidate and still validates it.
+out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-switch-task --relaunch --harness pi --preflight 2>&1) \
+  || fail "same-harness preflight did not validate the sampled profile: $out"
+assert_contains "$out" "profile-validated harness=pi model=openai-codex/model-pi effort=max" "same-harness preflight profile"
+# An explicit override survives a harness switch and is validated against the
+# target harness's own catalog.
+write_fake_grok_catalog "$HOME_DIR" 9.9.9-test '{"grok-example":{"info":{"supports_reasoning_effort":true,"reasoning_efforts":[{"id":"xhigh","value":"xhigh"},{"id":"high","value":"high"}]}}}'
+out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-switch-task --relaunch --harness grok --model grok-example --effort xhigh --preflight 2>&1) \
+  || fail "preflight refused an explicit override the target harness advertises: $out"
+assert_contains "$out" "profile-validated harness=grok model=grok-example effort=xhigh" "explicit override preflight profile"
+if out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" pi-switch-task --relaunch --harness grok --model grok-absent --effort xhigh --preflight 2>&1); then
+  fail "preflight accepted an explicit model the target harness does not advertise"
+fi
+assert_contains "$out" "which is not in 'grok models'" "explicit override refusal detail"
+[ "$(cat "$HOME_DIR/state/pi-switch-task.meta")" = "$meta_before" ] || fail "a refused preflight rewrote the task record"
+
+# --preflight is relaunch-only; a fresh spawn must not silently accept it.
+if out=$(fm_test_run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" preflight-fresh "$PROJ_DIR" --scout --preflight 2>&1); then
+  fail "--preflight was accepted without --relaunch"
+fi
+assert_contains "$out" "--preflight applies only to --relaunch" "--preflight scope refusal"
 
 echo "PASS: task/model preset launch controls stay exact across Pi, Grok, Claude Code, and OpenCode"

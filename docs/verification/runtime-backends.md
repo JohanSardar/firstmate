@@ -1717,6 +1717,7 @@ Its native App Server peer and watcher-close process are deterministic fixtures;
 
 Verified on 2026-09-15 with the globally installed `@earendil-works/pi-coding-agent` 0.85.1 on macOS 26.5.2 arm64, Node v26.8.1.
 An opt-in preset proves the requested thinking level through the installed package's real `ModelRuntime`/`ModelRegistry` and `getSupportedThinkingLevels` (`bin/fm-pi-reasoning-probe.mjs`), so a level the model does not support refuses before launch instead of being silently clamped to a lower one.
+The probe is forced offline: it pins `PI_OFFLINE=1` before creating the runtime and refreshes with `allowNetwork:false`, and the guard below boots it under a preload that makes any TCP connect fail, so an accidental catalog fetch is a loud failure rather than a green test over the network.
 Run this token-free guard after every Pi upgrade:
 
 ```sh
@@ -1731,7 +1732,8 @@ ok - real Pi SDK 0.85.1 resolves exact thinking levels: a mapped level passes, a
 
 The guard declares a local never-contacted `fm-live-fake` provider with a fully mapped model and a partially mapped model, reads no user credential, and makes no provider call.
 `tests/fm-spawn-task-model-preset.test.sh` pins the same refusal path through a full preset spawn against a fixture package and a synthetic catalog, and `tests/fm-pi-launch-plan.test.sh` owns the separate ordered-launch-plan fast guarantee.
-The preset launch delivers that plan itself: `bin/fm-spawn.sh` builds `--no-extensions -e <state>/<task>.pi-ext.ts` for a preset Pi launch, validates it with `bin/fm-pi-launch-plan-lib.sh`, and delivers the same args, so a fixed `fast` value is launchable and still recorded as requested-only.
+The preset launch delivers that plan itself when it carries a fixed fast value: `bin/fm-spawn.sh` builds `--no-extensions -e <state>/<task>.pi-ext.ts`, validates it with `bin/fm-pi-launch-plan-lib.sh`, and delivers the same args, so a fixed `fast` value is launchable and still recorded as requested-only.
+A preset without a fixed fast value keeps Pi's discovery and the ordinary single `-e` shape.
 
 ## Grok per-model preset reasoning efforts
 
@@ -1746,6 +1748,26 @@ The CLI's own fetched catalog at `$GROK_HOME/models_cache.json` (here `~/.grok/m
 `bin/fm-grok-effort-lib.sh` proves an opt-in preset's requested level against exactly that menu plus the catalog's `grok_version` stamp, so `grok-4.6` at `xhigh` launches while `grok-4.5` at `xhigh`, `max` on either model, a catalog written by another grok version, and a missing catalog all refuse before launch.
 No grok session or provider request is made by the check; it reads the CLI's own catalog file.
 `tests/fm-grok-effort-lib.test.sh` covers the verdicts from catalog fixtures, and `tests/fm-spawn-task-model-preset.test.sh` covers the same refusals and the accepted pair through a full preset spawn.
+
+## OpenCode persistent preset launch
+
+Verified on 2026-09-15 with the installed `opencode` 1.18.30 on macOS 26.5.2 arm64, token-free and offline.
+The installed `opencode run` subcommand is a one-shot batch command: its `run --interactive --auto` shape exits with the turn instead of leaving a worker pane, and its handler never reads the `--interactive` option.
+An opt-in preset therefore launches the long-lived TUI, `opencode --agent <per-launch-agent> --auto --prompt <brief>`, with the agent carrying the sampled `model` and `variant` in `OPENCODE_CONFIG_CONTENT`; OpenCode resolves an agent-configured variant ahead of the model default, so the TUI runs the exact sampled pair in the same persistent shape every ordinary OpenCode launch uses.
+Run this token-free guard after every OpenCode upgrade:
+
+```sh
+FM_OPENCODE_PRESET_AGENT_LIVE_E2E=1 bin/fm-test-run.sh tests/fm-opencode-preset-agent-live-e2e.test.sh
+```
+
+Observed result:
+
+```text
+ok - OpenCode 1.18.30 resolves the persistent preset agent with exact deepseek/deepseek-flash variant low
+```
+
+The guard discovers a model with an advertised variant from the installed catalog, resolves the same agent configuration through `opencode debug agent` with model fetches disabled, and asserts the resolved provider/model and variant.
+`tests/fm-spawn-task-model-preset.test.sh` pins the portable launch shape and the exact agent configuration, and `tests/fm-opencode-primary-live-e2e.test.sh` exercises the same long-lived TUI shape against the real harness.
 
 ## Oh My Pi (omp)
 

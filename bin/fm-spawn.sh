@@ -26,7 +26,7 @@
 #   Ship/scout launches always supply fm-dod-lib.sh's current worker role scope
 #   using the same private launch-brief overlay. This never rewrites a project's
 #   instruction files or a secondmate's charter.
-#        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>]
+#        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>] [--preflight]
 #   --relaunch launches a replacement agent for an EXISTING task into that
 #   task's own recorded endpoint and worktree instead of creating either. It is
 #   the launch half of the control plane (bin/fm-control.sh relaunch), which
@@ -49,7 +49,15 @@
 #   deterministic weighted choice, records the complete provenance before any
 #   endpoint is created, and reuses that choice on a retry. A sampled unavailable
 #   candidate or unsupported live model/setting refuses rather than falling back.
-#   Ordinary dispatch is unchanged when this flag is absent.
+#   Ordinary dispatch is unchanged when this flag is absent. On relaunch the
+#   recorded choice stays the task's provenance: when the target harness differs
+#   from the sampled candidate's harness, the sampled model/effort and the
+#   Pi-only fast value are not replayed onto it (explicit --model/--effort still
+#   override), because those axes were chosen for the other harness.
+#   --preflight is the relaunch-only, side-effect-free half of that resolution:
+#   it validates the same replacement profile the launch would use and exits
+#   before touching the endpoint, so bin/fm-control.sh can refuse a bad
+#   replacement before stopping the running agent. It never launches anything.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max|ultra> are concrete profile
@@ -518,6 +526,7 @@ MODE_SET=0
 YOLO_SET=0
 TRACEPARENT_SET=0
 RELAUNCH=0
+PREFLIGHT=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -543,6 +552,7 @@ for a in "$@"; do
     --scout) KIND=scout; KIND_SET=1 ;;
     --secondmate) KIND=secondmate; KIND_SET=1 ;;
     --relaunch) RELAUNCH=1 ;;
+    --preflight) PREFLIGHT=1 ;;
     --harness) want_value=harness ;;
     --harness=*) HARNESS_ARG=${a#--harness=}; HARNESS_SET=1 ;;
     --model) want_value=model ;;
@@ -563,6 +573,7 @@ for a in "$@"; do
   esac
 done
 [ -z "$want_value" ] || { echo "error: --$want_value requires a value" >&2; exit 1; }
+[ "$PREFLIGHT" -eq 0 ] || [ "$RELAUNCH" -eq 1 ] || { echo "error: --preflight applies only to --relaunch, where it validates the replacement profile before anything is stopped" >&2; exit 1; }
 [ "$HARNESS_SET" -eq 0 ] || [ -n "$HARNESS_ARG" ] || { echo "error: --harness requires a non-empty value" >&2; exit 1; }
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
@@ -1361,15 +1372,20 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # A relaunch must PROVE the previous agent is gone before it launches another
   # one into the same endpoint, and only tmux and herdr have a recovery-grade
   # classifier that can (bin/fm-control-lib.sh owns that capability table).
-  fm_control_backend_state_verified "$BACKEND" || {
-    echo "error: backend '$BACKEND' has no recovery-grade agent-state classifier, so a relaunch cannot prove the previous agent exited; refusing rather than risking two agents in one endpoint" >&2
-    exit 1
-  }
-  RELAUNCH_STATE=$(fm_backend_agent_state "$BACKEND" "$RELAUNCH_TARGET")
-  [ "$RELAUNCH_STATE" = dead ] || {
-    echo "error: task $ID's endpoint reads '$RELAUNCH_STATE'; a relaunch requires a positively agent-free endpoint (stop the agent first with bin/fm-control.sh $ID exit)" >&2
-    exit 1
-  }
+  # Preflight is the exception: it runs BEFORE the caller stops the old agent so
+  # an unusable replacement profile is refused while the task is still running,
+  # and it exits before any launch into the endpoint.
+  if [ "$PREFLIGHT" -eq 0 ]; then
+    fm_control_backend_state_verified "$BACKEND" || {
+      echo "error: backend '$BACKEND' has no recovery-grade agent-state classifier, so a relaunch cannot prove the previous agent exited; refusing rather than risking two agents in one endpoint" >&2
+      exit 1
+    }
+    RELAUNCH_STATE=$(fm_backend_agent_state "$BACKEND" "$RELAUNCH_TARGET")
+    [ "$RELAUNCH_STATE" = dead ] || {
+      echo "error: task $ID's endpoint reads '$RELAUNCH_STATE'; a relaunch requires a positively agent-free endpoint (stop the agent first with bin/fm-control.sh $ID exit)" >&2
+      exit 1
+    }
+  fi
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   [ -n "$KIND" ] || KIND=ship
@@ -1441,6 +1457,7 @@ DISPATCH_STARTED_AT=
 DISPATCH_STARTED_EPOCH=
 DISPATCH_RUNTIME_SESSION=
 DISPATCH_TOOL_VERSION=
+DISPATCH_HARNESS_OVERRIDE=0
 if [ "$RELAUNCH" -eq 1 ]; then
   DISPATCH_PRESET=$(fm_meta_get "$RELAUNCH_META" dispatch_preset)
   if [ -n "$DISPATCH_PRESET" ]; then
@@ -1463,6 +1480,20 @@ if [ "$RELAUNCH" -eq 1 ]; then
     }
     [ "$MODEL_SET" -eq 1 ] || MODEL=$(jq -er '.selected.model' "$DISPATCH_CHOICE_PATH")
     [ "$EFFORT_SET" -eq 1 ] || EFFORT=$(jq -er '.selected.effort' "$DISPATCH_CHOICE_PATH")
+    # A relaunch that moves the task onto a different harness cannot carry the
+    # sampled candidate's model/effort axes: they were chosen and validated for
+    # the harness the preset sampled. Explicit --model/--effort overrides are
+    # preserved; otherwise the replacement harness runs on its own defaults and
+    # the Pi-only fast request is dropped rather than replayed onto another
+    # harness. This runs before the caller stops the old agent (fm-control
+    # preflights, then stops), so the decision is made on the pre-stop side.
+    DISPATCH_SELECTED_HARNESS=$(jq -er '.selected.harness' "$DISPATCH_CHOICE_PATH") || exit 1
+    if [ "$ARG3" != "$DISPATCH_SELECTED_HARNESS" ]; then
+      DISPATCH_HARNESS_OVERRIDE=1
+      [ "$MODEL_SET" -eq 1 ] || MODEL=default
+      [ "$EFFORT_SET" -eq 1 ] || EFFORT=default
+      DISPATCH_FAST=
+    fi
   fi
 elif [ "$PRESET_SET" -eq 1 ]; then
   [ "$KIND" != secondmate ] || {
@@ -1766,7 +1797,14 @@ launch_template() {
       ;;
     opencode)
       if [ -n "$DISPATCH_PRESET" ]; then
-        printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode run --interactive --auto __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        # The installed `opencode run` subcommand is one-shot (its --interactive
+        # flag does not start a persistent worker on 1.18.x), so an opt-in
+        # preset launches the long-lived TUI with a per-launch agent carrying
+        # the exact sampled model and variant. OpenCode resolves an agent's
+        # configured variant ahead of the session default, and the TUI submits
+        # the initial prompt from --prompt; the config is env-scoped to this
+        # pane, so nothing global is written.
+        printf '%s' 'OPENCODE_CONFIG_CONTENT=__OPENCODECONFIG__ opencode --agent __OPENCODEAGENT__ --auto __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else
         printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       fi
@@ -2053,25 +2091,41 @@ fi
 if [ "$HARNESS" = omp ]; then
   omp_model_validate "$OMP_BIN" "$MODEL" || exit 1
 fi
-# The exact ordered extension plan an opt-in preset Pi launch delivers. Pi runs
-# before_provider_request handlers in extension load order and the last one owns
-# the payload, so a discovered extension could replace this worker's request.
-# A preset launch therefore disables discovery and names its required extension
-# explicitly: the generated task extension carries the busy-state, turn-end, and
-# optional fast-request hooks and is the last extension loaded. The same plan is
-# what fm_pi_fast_plan_guarantees checks below and what launch_template delivers,
-# never two spellings of it (bin/fm-pi-launch-plan-lib.sh owns the contract).
-# Ordinary launches keep Pi's discovery exactly as before.
+# The exact ordered extension plan a fixed-fast opt-in preset Pi launch delivers.
+# Pi runs before_provider_request handlers in extension load order and the last
+# one owns the payload, so a discovered extension could replace this worker's
+# request. Only a launch that carries a fixed fast value therefore disables
+# discovery and names its required extension explicitly: the generated task
+# extension carries the busy-state, turn-end, and fast-request hooks and is the
+# last extension loaded. The same plan is what fm_pi_fast_plan_guarantees checks
+# below and what launch_template delivers, never two spellings of it
+# (bin/fm-pi-launch-plan-lib.sh owns the contract). A preset without a fast
+# value, and every ordinary launch, keep Pi's discovery and the prior single -e
+# shape.
 PI_PRESET_PLAN_ARGS=()
-if [ -n "$DISPATCH_PRESET" ]; then
+if [ -n "$DISPATCH_PRESET" ] && [ -n "$DISPATCH_FAST" ]; then
   case "$HARNESS:$KIND" in
     pi:ship|pi:scout|pi-signed:ship|pi-signed:scout)
       PI_PRESET_PLAN_ARGS=(--no-extensions -e "$STATE/$ID.pi-ext.ts")
       ;;
   esac
 fi
-if [ -n "$DISPATCH_PRESET" ]; then
+# A harness-override relaunch uses neither the sampled model/effort nor the
+# sampled fast value, so there is no preset profile left to validate there; an
+# explicit override still runs the same checks the launch will run, which is
+# what lets fm-control's preflight refuse a bad replacement before it stops the
+# running agent.
+if [ -n "$DISPATCH_PRESET" ] \
+  && { [ "$DISPATCH_HARNESS_OVERRIDE" -eq 0 ] || [ "$MODEL_SET" -eq 1 ] || [ "$EFFORT_SET" -eq 1 ]; }; then
   dispatch_validate_live_settings || exit 1
+fi
+# --preflight is the read-only half of a relaunch: profile resolution and the
+# same live adapter checks the launch itself runs, with every mutating step
+# still ahead of it. It exits before launch delivery so the caller can stop the
+# old agent only once the replacement profile is proven launchable.
+if [ "$PREFLIGHT" -eq 1 ]; then
+  printf 'profile-validated harness=%s model=%s effort=%s\n' "$HARNESS" "${MODEL:-default}" "${EFFORT:-default}"
+  exit 0
 fi
 
 secondmate_registry_value() {
@@ -2218,14 +2272,9 @@ effort_flag_for_harness() {
           ;;
       esac
       ;;
-    opencode)
-      # The ordinary OpenCode TUI has no effort launch flag. An opt-in preset
-      # uses `opencode run --interactive`, whose --variant control is checked
-      # against this exact model's verbose catalog before launch.
-      if [ -n "$DISPATCH_PRESET" ]; then
-        printf -- '--variant %s ' "$(shell_quote "$effort")"
-      fi
-      ;;
+    # opencode has no effort flag on the ordinary TUI; an opt-in preset carries
+    # its variant through the per-launch agent configuration the launch template
+    # renders, so no effort flag is emitted for it.
     pi|pi-signed)
       # Pi 0.80.6 accepts the full shared effort vocabulary, including max, through
       # its --thinking flag.
@@ -4251,12 +4300,31 @@ sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 sq_worktree=$(shell_quote "$WT")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT" "$MODEL") || exit 1
+# The per-launch OpenCode config an opt-in preset delivers. The agent carries
+# the exact sampled model and variant, and OpenCode's model state prefers an
+# agent-configured variant over the model's default, so the long-lived TUI runs
+# the requested pair instead of the console default. The JSON is built with jq
+# so an exact model token cannot break the structure, and the whole content
+# stays env-scoped to this pane (never written to any OpenCode store).
+OPENCODE_PRESET_AGENT=
+OPENCODE_PRESET_CONFIG=
+if [ "$HARNESS" = opencode ] && [ -n "$DISPATCH_PRESET" ]; then
+  OPENCODE_PRESET_AGENT="fm-preset-$ID"
+  OPENCODE_PRESET_CONFIG=$(jq -cn --arg agent "$OPENCODE_PRESET_AGENT" --arg model "$MODEL" --arg variant "$EFFORT" \
+    '{permission:{"*":"allow"},agent:{($agent):{mode:"primary",model:$model,variant:$variant}}}') || {
+    echo "error: preset '$DISPATCH_PRESET' could not build the OpenCode agent configuration" >&2
+    exit 1
+  }
+  OPENCODE_PRESET_CONFIG=$(shell_quote "$OPENCODE_PRESET_CONFIG")
+fi
 SESSIONFLAG=
 [ -z "$DISPATCH_RUNTIME_SESSION" ] || SESSIONFLAG="--session-id $(shell_quote "$DISPATCH_RUNTIME_SESSION") "
 LAUNCH=${LAUNCH//__SESSIONFLAG__/$SESSIONFLAG}
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
 LAUNCH=${LAUNCH//__CLAUDEPERMFLAG__/$CLAUDE_PERM_FLAG}
+LAUNCH=${LAUNCH//__OPENCODECONFIG__/$OPENCODE_PRESET_CONFIG}
+LAUNCH=${LAUNCH//__OPENCODEAGENT__/$OPENCODE_PRESET_AGENT}
 if [ "$HARNESS" = rovo ]; then
   ROVOCONFIGOVERRIDE=$(rovo_config_override_flag "$EFFORT" "$DATA" "$STATE" "$ID") || {
     echo "error: could not resolve this task's home paths for rovo's allowedExternalPaths grant" >&2

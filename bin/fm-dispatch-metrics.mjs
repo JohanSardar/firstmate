@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Internal structured-ledger owner for bin/fm-dispatch-metrics.sh.
 
-import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, readdirSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, writeSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 function fail(message, code = 1) {
   process.stderr.write(`error: ${message}\n`);
@@ -87,7 +88,9 @@ function findNamed(root, name, depth = 3) {
 // Every runtime session a preset launch recorded for this task, oldest first.
 // A relaunch re-mints the session id (Claude and Grok refuse a reused id), so
 // the finish event must aggregate every incarnation the ledger recorded rather
-// than counting only the last one.
+// than counting only the last one. Sessionless incarnations are kept too: a
+// Pi or OpenCode launch records no runtime session, and dropping those entries
+// would let a tool switch hide prior usage instead of reporting it unknown.
 function readRecordedSessions(ledger, taskID) {
   if (!existsSync(ledger)) return [];
   const sessions = [];
@@ -100,12 +103,20 @@ function readRecordedSessions(ledger, taskID) {
       fail(`dispatch metrics ledger ${ledger} contains malformed JSON`);
     }
     if (event.event !== "launch-prepared" || event.task_id !== taskID) continue;
-    if (typeof event.runtime_session !== "string" || !event.runtime_session) continue;
-    if (sessions.some((entry) => entry.session === event.runtime_session)) continue;
-    sessions.push({ session: event.runtime_session, harness: event.effective?.harness ?? null });
+    const harness = event.effective?.harness ?? null;
+    const session = typeof event.runtime_session === "string" && event.runtime_session ? event.runtime_session : null;
+    if (sessions.some((entry) => entry.session === session && entry.harness === harness)) continue;
+    sessions.push({ session, harness });
   }
   return sessions;
 }
+// One Claude transcript's usage, including the Agent-tool subagent transcripts
+// that live beside the main session file. Every assistant message is counted
+// once per stable message id across the main transcript and every subagent
+// file: Claude mirrors the spawning Agent message into each subagent transcript,
+// so deduplicating within only one file would double count it. A usage-bearing
+// record without a stable id, or an unreadable transcript, keeps the whole
+// incarnation unknown rather than presenting a partial sum as recorded.
 function collectClaudeSession(session) {
   const root = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects");
   const matches = findNamed(root, `${session}.jsonl`, 3);
@@ -114,6 +125,7 @@ function collectClaudeSession(session) {
     status: "unknown",
     reason: `expected one Claude transcript, found ${matches.length}`,
   };
+  const mainPath = matches[0];
   let model = null;
   let effort = null;
   let speed = null;
@@ -121,29 +133,64 @@ function collectClaudeSession(session) {
   const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
   const counted = new Set();
   let unidentified = false;
-  for (const line of readFileSync(matches[0], "utf8").split("\n")) {
-    if (!line) continue;
-    let item;
-    try { item = JSON.parse(line); } catch { continue; }
-    if (item.type !== "assistant" || !object(item.message)) continue;
-    model = item.message.model || model;
-    effort = item.effort || effort;
-    const usage = item.message.usage;
-    if (!object(usage)) continue;
-    const messageID = item.message.id;
-    if (typeof messageID !== "string" || !messageID) {
-      unidentified = true;
-      continue;
+  let unreadable = null;
+  let subagentTranscripts = 0;
+  let subagentResponses = 0;
+  const readAssistantMessages = (path, { main = false } = {}) => {
+    let lines;
+    try {
+      lines = readFileSync(path, "utf8").split("\n");
+    } catch (error) {
+      unreadable = `${path}: ${error.message}`;
+      return 0;
     }
-    if (counted.has(messageID)) continue;
-    counted.add(messageID);
-    totals.input_tokens += Number(usage.input_tokens) || 0;
-    totals.cache_read_tokens += Number(usage.cache_read_input_tokens) || 0;
-    totals.cache_creation_tokens += Number(usage.cache_creation_input_tokens) || 0;
-    totals.output_tokens += Number(usage.output_tokens) || 0;
-    totals.thinking_tokens += Number(usage.output_tokens_details?.thinking_tokens) || 0;
-    speed = usage.speed || speed;
-    serviceTier = usage.service_tier || serviceTier;
+    let countedHere = 0;
+    for (const line of lines) {
+      if (!line) continue;
+      let item;
+      try { item = JSON.parse(line); } catch { continue; }
+      if (item.type !== "assistant" || !object(item.message)) continue;
+      if (main && item.isSidechain !== true) {
+        model = item.message.model || model;
+        effort = item.effort || effort;
+      }
+      const usage = item.message.usage;
+      if (!object(usage)) continue;
+      const messageID = item.message.id;
+      if (typeof messageID !== "string" || !messageID) {
+        unidentified = true;
+        continue;
+      }
+      if (counted.has(messageID)) continue;
+      counted.add(messageID);
+      countedHere += 1;
+      totals.input_tokens += Number(usage.input_tokens) || 0;
+      totals.cache_read_tokens += Number(usage.cache_read_input_tokens) || 0;
+      totals.cache_creation_tokens += Number(usage.cache_creation_input_tokens) || 0;
+      totals.output_tokens += Number(usage.output_tokens) || 0;
+      totals.thinking_tokens += Number(usage.output_tokens_details?.thinking_tokens) || 0;
+      if (main) {
+        speed = usage.speed || speed;
+        serviceTier = usage.service_tier || serviceTier;
+      }
+    }
+    return countedHere;
+  };
+  const responses = readAssistantMessages(mainPath, { main: true });
+  const subagentDir = join(dirname(mainPath), session, "subagents");
+  if (existsSync(subagentDir)) {
+    let entries;
+    try {
+      entries = readdirSync(subagentDir, { withFileTypes: true });
+    } catch (error) {
+      unreadable = `${subagentDir}: ${error.message}`;
+      entries = [];
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      subagentTranscripts += 1;
+      subagentResponses += readAssistantMessages(join(subagentDir, entry.name));
+    }
   }
   return {
     session_id: session,
@@ -153,9 +200,10 @@ function collectClaudeSession(session) {
     effort_used: effort,
     speed,
     service_tier: serviceTier,
-    usage: !model ? null : unidentified
-      ? { status: "unknown", kind: "tokens", reason: "transcript usage without a stable assistant message id cannot be deduplicated" }
-      : { status: "recorded-local", kind: "tokens", responses: counted.size, ...totals, completeness: "not-proven-for-aborted-turns" },
+    subagent_transcripts: subagentTranscripts,
+    usage: !model ? null : unreadable || unidentified
+      ? { status: "unknown", kind: "tokens", reason: unreadable ?? "transcript usage without a stable assistant message id cannot be deduplicated" }
+      : { status: "recorded-local", kind: "tokens", responses: responses + subagentResponses, subagent_responses: subagentResponses, subagent_transcripts: subagentTranscripts, ...totals, completeness: "not-proven-for-aborted-turns" },
   };
 }
 function incompleteRuntime(basis, observations, latest) {
@@ -183,8 +231,12 @@ function collectClaude(sessions) {
   }
   const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
   let responses = 0;
+  let subagentResponses = 0;
+  let subagentTranscripts = 0;
   for (const entry of observations) {
     responses += entry.usage.responses;
+    subagentResponses += entry.usage.subagent_responses ?? 0;
+    subagentTranscripts += entry.usage.subagent_transcripts ?? 0;
     for (const key of Object.keys(totals)) totals[key] += entry.usage[key] ?? 0;
   }
   return {
@@ -200,6 +252,8 @@ function collectClaude(sessions) {
       status: "recorded-local",
       kind: "tokens",
       responses,
+      subagent_responses: subagentResponses,
+      subagent_transcripts: subagentTranscripts,
       ...totals,
       incarnations: observations.length,
       completeness: "not-proven-for-aborted-turns",
@@ -215,20 +269,63 @@ function collectGrokSession(session) {
     reason: `expected one Grok session summary, found ${matches.length}`,
   };
   const summary = readJson(matches[0], "Grok session summary");
-  return {
+  const observation = {
     session_id: session,
     status: summary.current_model_id ? "observed" : "unknown",
     basis: "local-grok-session-summary",
     model_used: summary.current_model_id || null,
     effort_used: summary.reasoning_effort || null,
   };
+  // Grok writes its authoritative per-session token totals to usage.json next
+  // to summary.json. The totals are local observations, not a provider invoice;
+  // a missing or incomplete file stays unknown instead of reporting zero.
+  const usagePath = join(dirname(matches[0]), "usage.json");
+  if (!existsSync(usagePath)) {
+    observation.usage = { status: "unknown", kind: "tokens", reason: "no local Grok usage.json for this session" };
+    return observation;
+  }
+  let usage;
+  try {
+    usage = JSON.parse(readFileSync(usagePath, "utf8"));
+  } catch (error) {
+    observation.usage = { status: "unknown", kind: "tokens", reason: `cannot read Grok usage.json: ${error.message}` };
+    return observation;
+  }
+  const block = object(usage) && object(usage.session) ? usage.session : null;
+  const count = (value) => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null);
+  const tokens = block ? {
+    input_tokens: count(block.inputTokens),
+    output_tokens: count(block.outputTokens),
+    cache_read_tokens: count(block.cachedReadTokens),
+    cache_creation_tokens: count(block.cacheCreationTokens),
+    thinking_tokens: count(block.reasoningTokens),
+  } : null;
+  if (!tokens || Object.values(tokens).some((value) => value === null)) {
+    observation.usage = { status: "unknown", kind: "tokens", reason: "Grok usage.json did not report a complete local token block" };
+    return observation;
+  }
+  observation.usage = {
+    status: "recorded-local",
+    kind: "tokens",
+    responses: count(block.modelCalls) ?? 0,
+    ...tokens,
+    completeness: "not-proven-for-aborted-turns",
+  };
+  if (object(block.modelUsage)) observation.models_used = Object.keys(block.modelUsage);
+  return observation;
 }
 function collectGrok(sessions) {
   const observations = sessions.map(collectGrokSession);
   if (observations.length === 1) return observations[0];
   const latest = observations[observations.length - 1];
-  if (observations.some((entry) => entry.status !== "observed")) {
+  if (observations.some((entry) => entry.status !== "observed" || entry.usage?.status !== "recorded-local")) {
     return incompleteRuntime("local-grok-session-summary", observations, latest);
+  }
+  const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
+  let responses = 0;
+  for (const entry of observations) {
+    responses += entry.usage.responses ?? 0;
+    for (const key of Object.keys(totals)) totals[key] += entry.usage[key] ?? 0;
   }
   return {
     status: "observed",
@@ -237,18 +334,387 @@ function collectGrok(sessions) {
     sessions: observations.map((entry) => entry.session_id),
     model_used: latest.model_used,
     effort_used: latest.effort_used,
+    usage: {
+      status: "recorded-local",
+      kind: "tokens",
+      responses,
+      ...totals,
+      incarnations: observations.length,
+      completeness: "not-proven-for-aborted-turns",
+    },
   };
+}
+function resolvedPathsEqual(left, right) {
+  if (!left || !right) return false;
+  if (left === right) return true;
+  let resolvedLeft = left;
+  let resolvedRight = right;
+  try { resolvedLeft = realpathSync(left); } catch { /* keep the recorded spelling */ }
+  try { resolvedRight = realpathSync(right); } catch { /* keep the recorded spelling */ }
+  return resolvedLeft === resolvedRight;
+}
+function taskStartedEpoch(fields) {
+  const value = Number(fields.dispatch_started_epoch);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+// A session is task-attributable only when it began at (or within a small
+// clock-skew window after) this task's launch. Without the bound, a reused
+// worktree path could pull a previous task's sessions into this task's totals.
+function withinTaskWindow(startedEpoch, startMillis) {
+  if (startedEpoch === null || !Number.isFinite(startMillis)) return true;
+  return startMillis / 1000 >= startedEpoch - 300;
+}
+// Reading a session header should not cost a full transcript read: a Pi session
+// JSONL grows with every turn, and the sessions scan only needs line one.
+function readFirstLine(path, maxBytes = 65536) {
+  const descriptor = openSync(path, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const read = readSync(descriptor, buffer, 0, maxBytes, 0);
+    const text = buffer.subarray(0, read).toString("utf8");
+    const newline = text.indexOf("\n");
+    return newline >= 0 ? text.slice(0, newline) : text;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+function usageUnknown(basis, reason) {
+  return {
+    status: "unknown",
+    basis,
+    session_id: null,
+    sessions: [],
+    model_used: null,
+    effort_used: null,
+    reason,
+    usage: { status: "unknown", kind: "tokens", reason },
+  };
+}
+function unusableObservation(basis, entries, latest, reason) {
+  return {
+    status: "unknown",
+    basis,
+    session_id: latest?.session_id ?? null,
+    sessions: entries,
+    model_used: latest?.model_used ?? null,
+    effort_used: latest?.effort_used ?? null,
+    partial: true,
+    reason,
+    usage: { status: "unknown", kind: "tokens", partial: true, reason },
+  };
+}
+// Pi keeps one JSONL per session under the agent dir's sessions/ tree; the
+// header records the session cwd, so sessions are attributed to this task's
+// worktree by resolved path and then bounded by the launch window. Every
+// assistant message carries the provider's own token split (input, output,
+// cache read/write, reasoning), which is the richest local usage evidence Pi
+// offers. An unreadable file, an id-less usage record, or a matched session
+// with no measurable turn keeps the whole observation unknown rather than
+// presenting a partial sum as complete.
+function collectPiTaskUsage(worktree, startedEpoch) {
+  const basis = "local-pi-sessions";
+  if (!worktree) return usageUnknown(basis, "task metadata records no worktree, so Pi session evidence cannot be attributed");
+  const root = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "sessions");
+  if (!existsSync(root)) return usageUnknown(basis, `no Pi sessions directory at ${root}`);
+  const files = [];
+  try {
+    for (const directory of readdirSync(root, { withFileTypes: true })) {
+      if (!directory.isDirectory()) continue;
+      const directoryPath = join(root, directory.name);
+      for (const entry of readdirSync(directoryPath, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+        const path = join(directoryPath, entry.name);
+        let header;
+        try {
+          header = JSON.parse(readFirstLine(path));
+        } catch {
+          continue;
+        }
+        if (!object(header) || header.type !== "session" || !header.cwd) continue;
+        if (!resolvedPathsEqual(header.cwd, worktree)) continue;
+        if (!withinTaskWindow(startedEpoch, header.timestamp ? Date.parse(header.timestamp) : NaN)) continue;
+        files.push({ path, session_id: header.id ?? null, timestamp: header.timestamp ?? null });
+      }
+    }
+  } catch (error) {
+    return usageUnknown(basis, `cannot scan Pi sessions at ${root}: ${error.message}`);
+  }
+  if (files.length === 0) return usageUnknown(basis, "no Pi session record for this task's worktree was found");
+  // Chronological order matters: the observation's model/effort must come from
+  // the latest incarnation, not whichever directory readdir happened to visit.
+  files.sort((left, right) => {
+    const leftTime = left.timestamp ? Date.parse(left.timestamp) : NaN;
+    const rightTime = right.timestamp ? Date.parse(right.timestamp) : NaN;
+    if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime;
+    return left.path.localeCompare(right.path);
+  });
+  const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
+  const counted = new Set();
+  const emptySessions = [];
+  const sessions = [];
+  let responses = 0;
+  let unidentified = false;
+  let unreadable = null;
+  let model = null;
+  let effort = null;
+  for (const file of files) {
+    const label = file.session_id ?? file.path;
+    sessions.push(label);
+    let lines;
+    try {
+      lines = readFileSync(file.path, "utf8").split("\n");
+    } catch (error) {
+      unreadable = `${file.path}: ${error.message}`;
+      continue;
+    }
+    let sessionResponses = 0;
+    for (const line of lines) {
+      if (!line) continue;
+      let item;
+      try { item = JSON.parse(line); } catch { continue; }
+      if (item.type === "thinking_level_change") {
+        if (typeof item.thinkingLevel === "string" && item.thinkingLevel) effort = item.thinkingLevel;
+        continue;
+      }
+      if (item.type !== "message" || !object(item.message) || item.message.role !== "assistant") continue;
+      const usage = item.message.usage;
+      if (!object(usage)) continue;
+      const recordID = typeof item.id === "string" && item.id ? item.id : null;
+      if (!recordID) {
+        unidentified = true;
+        continue;
+      }
+      if (counted.has(recordID)) continue;
+      counted.add(recordID);
+      sessionResponses += 1;
+      responses += 1;
+      totals.input_tokens += Number(usage.input) || 0;
+      totals.cache_read_tokens += Number(usage.cacheRead) || 0;
+      totals.cache_creation_tokens += Number(usage.cacheWrite) || 0;
+      totals.output_tokens += Number(usage.output) || 0;
+      totals.thinking_tokens += Number(usage.reasoning) || 0;
+      if (item.message.provider && item.message.model) model = `${item.message.provider}/${item.message.model}`;
+    }
+    if (sessionResponses === 0) emptySessions.push(label);
+  }
+  const latest = { session_id: files[files.length - 1]?.session_id ?? null, model_used: model, effort_used: effort };
+  if (unreadable || unidentified || emptySessions.length > 0) {
+    const reason = unreadable
+      ?? (emptySessions.length > 0
+        ? `Pi session(s) without measurable usage: ${emptySessions.join(",")}`
+        : "a Pi session had a usage record without a stable message id");
+    return unusableObservation(basis, sessions.map((session_id) => ({ session_id, status: "unknown" })), latest, reason);
+  }
+  return {
+    status: "observed",
+    basis,
+    session_id: latest.session_id,
+    sessions,
+    model_used: model,
+    effort_used: effort,
+    usage: {
+      status: "recorded-local",
+      kind: "tokens",
+      responses,
+      ...totals,
+      sessions: files.length,
+      completeness: "not-proven-for-aborted-turns",
+    },
+  };
+}
+// OpenCode 1.18.x writes its session/message store to sqlite; older versions
+// keep the JSON storage tree. Both are read directly, never through the CLI:
+// sessions are attributed by their recorded directory and bounded by the
+// launch window, and the same token split is summed across the parent and its
+// child (subagent) sessions, whose rows are separate and therefore not double
+// counted.
+function opencodeDataDir() {
+  const base = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+  return join(base, "opencode");
+}
+function opencodeDatabasePath() {
+  const dataDir = opencodeDataDir();
+  const configured = process.env.OPENCODE_DB;
+  if (!configured) return join(dataDir, "opencode.db");
+  if (configured === ":memory:") return null;
+  return configured.startsWith("/") ? configured : join(dataDir, configured);
+}
+function collectOpencodeSqlite(dbPath, worktree, startedEpoch) {
+  const basis = "local-opencode-sessions";
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = createRequire(import.meta.url)("node:sqlite"));
+  } catch (error) {
+    return usageUnknown(basis, `this node runtime cannot read OpenCode's sqlite store: ${error.message}`);
+  }
+  if (typeof DatabaseSync !== "function") return usageUnknown(basis, "this node runtime exposes no node:sqlite DatabaseSync");
+  let database;
+  try {
+    database = new DatabaseSync(dbPath, { readOnly: true });
+  } catch (error) {
+    return usageUnknown(basis, `cannot open OpenCode store ${dbPath}: ${error.message}`);
+  }
+  try {
+    let rows;
+    let messageCounts;
+    try {
+      rows = database.prepare("select id, directory, time_created, model, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write from session").all();
+      messageCounts = database.prepare("select session_id, count(*) as count from message where json_extract(data, '$.role') = 'assistant' group by session_id").all();
+    } catch (error) {
+      return usageUnknown(basis, `cannot read OpenCode sessions from ${dbPath}: ${error.message}`);
+    }
+    const matched = rows.filter((row) => resolvedPathsEqual(row.directory, worktree) && withinTaskWindow(startedEpoch, Number(row.time_created)));
+    if (matched.length === 0) return usageUnknown(basis, "no OpenCode session for this task's worktree was found");
+    matched.sort((left, right) => Number(left.time_created) - Number(right.time_created));
+    const counts = new Map(messageCounts.map((row) => [row.session_id, Number(row.count) || 0]));
+    let responses = 0;
+    const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
+    for (const row of matched) {
+      responses += counts.get(row.id) ?? 0;
+      totals.input_tokens += Number(row.tokens_input) || 0;
+      totals.cache_read_tokens += Number(row.tokens_cache_read) || 0;
+      totals.cache_creation_tokens += Number(row.tokens_cache_write) || 0;
+      totals.output_tokens += Number(row.tokens_output) || 0;
+      totals.thinking_tokens += Number(row.tokens_reasoning) || 0;
+    }
+    const latest = matched[matched.length - 1];
+    let modelUsed = null;
+    let effortUsed = null;
+    try {
+      const model = JSON.parse(latest.model);
+      if (model && model.providerID && model.id) modelUsed = `${model.providerID}/${model.id}`;
+      if (typeof model?.variant === "string" && model.variant && model.variant !== "default") effortUsed = model.variant;
+    } catch { /* an unreadable model record stays unknown */ }
+    return {
+      status: "observed",
+      basis,
+      session_id: latest.id,
+      sessions: matched.map((row) => row.id),
+      model_used: modelUsed,
+      effort_used: effortUsed,
+      usage: {
+        status: "recorded-local",
+        kind: "tokens",
+        responses,
+        ...totals,
+        sessions: matched.length,
+        completeness: "not-proven-for-aborted-turns",
+      },
+    };
+  } finally {
+    try { database.close(); } catch { /* already closed */ }
+  }
+}
+function collectOpencodeJsonStorage(storage, worktree, startedEpoch) {
+  const basis = "local-opencode-storage";
+  const sessionRoot = join(storage, "session");
+  const messageRoot = join(storage, "message");
+  if (!existsSync(sessionRoot)) return usageUnknown(basis, `no OpenCode session records at ${sessionRoot}`);
+  const matched = [];
+  try {
+    for (const project of readdirSync(sessionRoot, { withFileTypes: true })) {
+      if (!project.isDirectory()) continue;
+      for (const entry of readdirSync(join(sessionRoot, project.name), { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+        let record;
+        try {
+          record = JSON.parse(readFileSync(join(sessionRoot, project.name, entry.name), "utf8"));
+        } catch {
+          continue;
+        }
+        if (!object(record) || !record.directory) continue;
+        if (!resolvedPathsEqual(record.directory, worktree)) continue;
+        if (!withinTaskWindow(startedEpoch, Number(record.time?.created))) continue;
+        matched.push(record);
+      }
+    }
+  } catch (error) {
+    return usageUnknown(basis, `cannot scan OpenCode session storage: ${error.message}`);
+  }
+  if (matched.length === 0) return usageUnknown(basis, "no OpenCode session for this task's worktree was found");
+  matched.sort((left, right) => Number(left.time?.created ?? 0) - Number(right.time?.created ?? 0));
+  const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
+  let responses = 0;
+  let unreadable = null;
+  for (const record of matched) {
+    const directory = join(messageRoot, record.id);
+    if (!existsSync(directory)) {
+      unreadable = `no OpenCode message records for session ${record.id}`;
+      continue;
+    }
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      unreadable = `${directory}: ${error.message}`;
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      let message;
+      try {
+        message = JSON.parse(readFileSync(join(directory, entry.name), "utf8"));
+      } catch (error) {
+        unreadable = `${join(directory, entry.name)}: ${error.message}`;
+        continue;
+      }
+      if (!object(message) || message.role !== "assistant" || !object(message.tokens)) continue;
+      responses += 1;
+      totals.input_tokens += Number(message.tokens.input) || 0;
+      totals.cache_read_tokens += Number(message.tokens.cache?.read) || 0;
+      totals.cache_creation_tokens += Number(message.tokens.cache?.write) || 0;
+      totals.output_tokens += Number(message.tokens.output) || 0;
+      totals.thinking_tokens += Number(message.tokens.reasoning) || 0;
+    }
+  }
+  const latest = matched[matched.length - 1];
+  if (unreadable) {
+    return unusableObservation(basis, matched.map((record) => ({ session_id: record.id, status: "unknown" })), { session_id: latest.id }, unreadable);
+  }
+  const modelUsed = latest.model?.providerID && latest.model?.id ? `${latest.model.providerID}/${latest.model.id}` : null;
+  const effortUsed = typeof latest.model?.variant === "string" && latest.model.variant && latest.model.variant !== "default" ? latest.model.variant : null;
+  return {
+    status: "observed",
+    basis,
+    session_id: latest.id,
+    sessions: matched.map((record) => record.id),
+    model_used: modelUsed,
+    effort_used: effortUsed,
+    usage: {
+      status: "recorded-local",
+      kind: "tokens",
+      responses,
+      ...totals,
+      sessions: matched.length,
+      completeness: "not-proven-for-aborted-turns",
+    },
+  };
+}
+function collectOpencodeTaskUsage(worktree, startedEpoch) {
+  const dbPath = opencodeDatabasePath();
+  if (dbPath && existsSync(dbPath)) return collectOpencodeSqlite(dbPath, worktree, startedEpoch);
+  const storage = join(opencodeDataDir(), "storage");
+  if (existsSync(storage)) return collectOpencodeJsonStorage(storage, worktree, startedEpoch);
+  return usageUnknown("local-opencode-sessions", `no OpenCode session store at ${opencodeDataDir()}`);
+}
+function usageHarnessFamily(harness) {
+  // pi and pi-signed are the same runtime and the same local session store, so a
+  // switch between those identities is not a cross-harness move for usage.
+  return harness === "pi-signed" ? "pi" : harness;
 }
 function collectRuntime(choicePath, fields, recordedSessions) {
   const runtimePath = choicePath.replace(/\.dispatch-choice\.json$/, ".dispatch-runtime.json");
-  if (existsSync(runtimePath)) return readJson(runtimePath, "dispatch runtime observation");
+  const runtime = existsSync(runtimePath) ? readJson(runtimePath, "dispatch runtime observation") : null;
+  const family = usageHarnessFamily(fields.harness);
   // A relaunch may change harness, and a local transcript or session summary
   // from one harness is not a compatible unit with another's. Dropping the
   // foreign incarnations would present one harness's total as the task's
   // complete usage, so nothing is filtered: the observation stays unknown with
   // the reason, and only a single-harness incarnation set is aggregated.
+  // Sessionless incarnations count here too, or a Pi/OpenCode tool switch could
+  // hide the prior harness's usage from this guard.
   const foreignHarnesses = [...new Set(recordedSessions
-    .filter((entry) => entry.harness !== null && entry.harness !== fields.harness)
+    .filter((entry) => entry.harness !== null && usageHarnessFamily(entry.harness) !== family)
     .map((entry) => entry.harness))];
   if (foreignHarnesses.length > 0) {
     const reason = `recorded launch incarnation(s) ran on ${foreignHarnesses.join(", ")} while this launch runs on ${fields.harness}; complete cross-harness usage aggregation is not proven`;
@@ -264,17 +730,41 @@ function collectRuntime(choicePath, fields, recordedSessions) {
       usage: { status: "unknown", kind: "tokens", partial: true, reason },
     };
   }
-  const ordered = [];
-  for (const entry of recordedSessions) {
-    if (!ordered.includes(entry.session)) ordered.push(entry.session);
+  const startedEpoch = taskStartedEpoch(fields);
+  const worktree = fields.worktree || null;
+  let collected = null;
+  if (family === "claude" || family === "grok") {
+    const ordered = [];
+    for (const entry of recordedSessions) {
+      if (entry.session && !ordered.includes(entry.session)) ordered.push(entry.session);
+    }
+    if (fields.dispatch_runtime_session && !ordered.includes(fields.dispatch_runtime_session)) {
+      ordered.push(fields.dispatch_runtime_session);
+    }
+    const sessionless = recordedSessions.filter((entry) => entry.session === null).length;
+    if (ordered.length > 0) {
+      const observed = family === "claude" ? collectClaude(ordered) : collectGrok(ordered);
+      collected = sessionless > 0
+        ? unusableObservation(observed.basis ?? `local-${family}-transcript`, observed.sessions?.map((session_id) => ({ session_id, status: "unknown" })) ?? [], observed, `${sessionless} launch incarnation(s) recorded no runtime session, so their usage cannot be bound`)
+        : observed;
+    } else if (sessionless > 0) {
+      collected = usageUnknown(`local-${family}-transcript`, `${sessionless} launch incarnation(s) recorded no runtime session, so their usage cannot be bound`);
+    }
+  } else if (family === "pi") {
+    if (recordedSessions.length > 0) collected = collectPiTaskUsage(worktree, startedEpoch);
+  } else if (family === "opencode") {
+    if (recordedSessions.length > 0) collected = collectOpencodeTaskUsage(worktree, startedEpoch);
   }
-  if (fields.dispatch_runtime_session && !ordered.includes(fields.dispatch_runtime_session)) {
-    ordered.push(fields.dispatch_runtime_session);
+  if (runtime) {
+    if (!collected) return runtime;
+    return {
+      ...runtime,
+      usage_basis: collected.basis ?? runtime.usage_basis ?? null,
+      sessions: collected.sessions ?? runtime.sessions ?? [],
+      usage: collected.usage ?? runtime.usage,
+    };
   }
-  if (ordered.length === 0) return null;
-  if (fields.harness === "claude") return collectClaude(ordered);
-  if (fields.harness === "grok") return collectGrok(ordered);
-  return null;
+  return collected;
 }
 function launchSettings(record, fields) {
   const requested = record.selected;
