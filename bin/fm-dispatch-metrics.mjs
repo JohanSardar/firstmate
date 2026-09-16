@@ -226,6 +226,7 @@ function collectClaudeSession(session) {
   const totals = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, thinking_tokens: 0 };
   const counted = new Set();
   let unidentified = false;
+  let assistantLines = 0;
   let unreadable = null;
   let subagentTranscripts = 0;
   let subagentResponses = 0;
@@ -242,6 +243,7 @@ function collectClaudeSession(session) {
       if (!line) continue;
       let item;
       try { item = JSON.parse(line); } catch { continue; }
+      if (main && item.type === "assistant") assistantLines += 1;
       if (item.type !== "assistant" || !object(item.message)) continue;
       if (main && item.isSidechain !== true) {
         model = item.message.model || model;
@@ -285,7 +287,7 @@ function collectClaudeSession(session) {
       subagentResponses += readAssistantMessages(join(subagentDir, entry.name));
     }
   }
-  return {
+  const observation = {
     session_id: session,
     status: model ? "observed" : "unknown",
     basis: "local-claude-transcript",
@@ -294,10 +296,23 @@ function collectClaudeSession(session) {
     speed,
     service_tier: serviceTier,
     subagent_transcripts: subagentTranscripts,
-    usage: !model ? null : unreadable || unidentified
-      ? { status: "unknown", kind: "tokens", reason: unreadable ?? "transcript usage without a stable assistant message id cannot be deduplicated" }
-      : { status: "recorded-local", kind: "tokens", responses: responses + subagentResponses, subagent_responses: subagentResponses, subagent_transcripts: subagentTranscripts, ...totals, completeness: "not-proven-for-aborted-turns" },
   };
+  if (!model) {
+    // A null usage block must carry this incarnation's own reason, so the
+    // finish event can name the precise cause (unreadable transcript versus no
+    // attributable assistant line) instead of falling back to a generic "no
+    // observation was supplied".
+    observation.reason = unreadable
+      ?? (assistantLines > 0
+        ? "the Claude transcript's assistant line(s) record no model identifier, so this incarnation's usage cannot be attributed"
+        : "no attributable assistant line in this incarnation's Claude transcript");
+    observation.usage = null;
+    return observation;
+  }
+  observation.usage = unreadable || unidentified
+    ? { status: "unknown", kind: "tokens", reason: unreadable ?? "transcript usage without a stable assistant message id cannot be deduplicated" }
+    : { status: "recorded-local", kind: "tokens", responses: responses + subagentResponses, subagent_responses: subagentResponses, subagent_transcripts: subagentTranscripts, ...totals, completeness: "not-proven-for-aborted-turns" };
+  return observation;
 }
 // A multi-incarnation observation is complete only when every incarnation has
 // its own complete local record. The reason names each missing incarnation
@@ -1112,7 +1127,11 @@ if (command === "launch" || command === "finish") {
       generation,
       totals: launchTotals(launched.launches, launched.status === "complete" ? null : launched.reason),
       runtime_observed: runtimeObserved,
-      usage: runtimeObserved?.usage || { status: "unknown", reason: "no task-attributable provider usage observation was supplied" },
+      usage: runtimeObserved?.usage || {
+        status: "unknown",
+        kind: "tokens",
+        reason: runtimeObserved?.reason ?? "no task-attributable provider usage observation was supplied",
+      },
       // Delivery success and a bare quality status are never evidence that no
       // bug was found or escaped. A recorded defect is attributed to a specific
       // party only when exactly one known origin was recorded for this task

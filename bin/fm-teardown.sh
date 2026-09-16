@@ -1391,18 +1391,42 @@ content_in_default() {
   [ "$merged_tree" = "$default_tree" ]
 }
 
+# Is HEAD already contained in the project clone's own default branch? That is
+# where bin/fm-merge-local.sh fast-forwards an approved local-only delivery, and
+# the clone need not have pushed that branch anywhere yet, so origin alone
+# cannot prove it. Returns 1 when the local default ref is missing or
+# conclusively does not contain HEAD, and 2 when the default branch name cannot
+# be resolved or HEAD cannot be read, so callers keep unknown distinct from a
+# real negative.
+head_in_local_default() {
+  local default head
+  default=$(default_branch) || return 2
+  git -C "$PROJ" rev-parse --quiet --verify "refs/heads/$default" >/dev/null 2>&1 || return 1
+  head=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 2
+  if git -C "$PROJ" merge-base --is-ancestor "$head" "refs/heads/$default" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
 # Landing evidence for the current worktree, three-valued so a caller that needs
 # delivery evidence can tell a conclusive "not landed" from evidence it could not
 # gather. The verdict is published in the WORK_LANDING_EVIDENCE global rather
 # than captured from stdout, because gathering it must run in the calling shell:
 # discovering a merged PR sets PR_URL for the later backlog close, and a command
-# substitution would keep that side effect in a subshell. landed means one proof
-# held; unlanded means both proofs ran and conclusively found nothing landed;
-# unknown means at least one proof could not complete, and delivery must then
-# stay unknown rather than be guessed.
+# substitution would keep that side effect in a subshell. Three proofs are
+# tried: a merged PR containing the local work, the content already present in
+# the default branch (fallback, covering the no-PR and squash paths), and the
+# local default branch already containing HEAD (the local-only fast-forward
+# merge, which the clone need not have pushed anywhere yet). landed means one
+# proof held; unlanded means every proof ran and conclusively found nothing
+# landed; unknown means at least one proof could not complete, and delivery
+# must then stay unknown rather than be guessed. The proof set is deliberately
+# shared by cleanup delivery classification and the safety gate so the two
+# agree on what landed evidence is; each caller keeps its own refusal strength.
 WORK_LANDING_EVIDENCE=
 work_landing_evidence() {
-  local branch=$1 pr_rc content_rc
+  local branch=$1 pr_rc content_rc local_rc
   WORK_LANDING_EVIDENCE=
   if pr_is_merged "$branch"; then
     WORK_LANDING_EVIDENCE=landed
@@ -1416,7 +1440,13 @@ work_landing_evidence() {
   else
     content_rc=$?
   fi
-  if [ "$pr_rc" -eq 1 ] && [ "$content_rc" -eq 1 ]; then
+  if head_in_local_default; then
+    WORK_LANDING_EVIDENCE=landed
+    return 0
+  else
+    local_rc=$?
+  fi
+  if [ "$pr_rc" -eq 1 ] && [ "$content_rc" -eq 1 ] && [ "$local_rc" -eq 1 ]; then
     WORK_LANDING_EVIDENCE=unlanded
   else
     WORK_LANDING_EVIDENCE=unknown
@@ -1426,11 +1456,12 @@ work_landing_evidence() {
 
 # Has the worktree's committed work actually LANDED, though its commits are not
 # reachable from any remote-tracking branch? True when a merged PR proves the
-# current local work is contained in the PR head, OR the content is already in the
-# default branch (fallback, which also covers the no-PR path). False for both
-# genuinely unlanded work and unprovable evidence, so the safety gate refuses
-# either way; callers that must distinguish those cases read the
-# WORK_LANDING_EVIDENCE global instead.
+# current local work is contained in the PR head, the content is already in the
+# default branch (fallback, which also covers the no-PR path), or the local
+# default branch already contains HEAD (the approved local-only fast-forward
+# merge). False for both genuinely unlanded work and unprovable evidence, so
+# the safety gate refuses either way; callers that must distinguish those
+# cases read the WORK_LANDING_EVIDENCE global instead.
 work_is_landed() {
   work_landing_evidence "$1"
   [ "$WORK_LANDING_EVIDENCE" = landed ]
@@ -1438,23 +1469,20 @@ work_is_landed() {
 
 # The delivery outcome recorded for a preset task at cleanup, published in the
 # DISPATCH_OUTCOME global (never stdout, for the same in-shell evidence reason).
-# The ordinary path has already proved landed work for a ship and a delivered
-# report for a scout, so those outcomes are direct. --force only authorizes
-# skipping those refusals; it is not evidence that the work was discarded, so a
-# forced cleanup classifies delivery from the same landed evidence: landed when a
-# proof held (the local copy was then discarded under explicit authorization),
-# discarded only when both proofs conclusively found no landing and the cleanup
-# is discarding real unlanded work, and unknown when no proof was reachable at
-# all.
+# A scout's outcome is its delivered report. Every ship cleanup, ordinary or
+# forced, classifies delivery from the same landed evidence instead of from
+# --force: landed when a proof held (an ordinary cleanup has already passed the
+# safety gate, and a forced cleanup's local copy was discarded under explicit
+# authorization), discarded only when every proof ran and conclusively found no
+# landing, and unknown when no proof was reachable at all. --force only
+# authorizes skipping those refusals; it is not evidence that the work was
+# discarded, so the finish event records the delivery outcome and the authorized
+# local discard as separate axes (bin/fm-dispatch-metrics.mjs owns the fields).
 DISPATCH_OUTCOME=
 preset_delivery_outcome() {
   local branch
   if [ "$KIND" = scout ]; then
     if [ -f "$DATA/$ID/report.md" ]; then DISPATCH_OUTCOME=report-complete; else DISPATCH_OUTCOME=discarded; fi
-    return 0
-  fi
-  if [ "$FORCE" != "--force" ]; then
-    DISPATCH_OUTCOME=landed
     return 0
   fi
   if ! teardown_owns_worktree || [ ! -d "$WT" ] || ! inspectable_git_worktree "$WT"; then

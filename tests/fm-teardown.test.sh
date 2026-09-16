@@ -888,6 +888,106 @@ test_preset_force_scout_with_report_records_report_complete() {
   pass "a forced scout cleanup with a delivered report records report-complete"
 }
 
+# The ordinary cleanup path classifies delivery from the same landed evidence as
+# the forced path. A task whose work was pushed to a fork but never merged, and
+# whose content is conclusively absent from the default branch, is a discarded
+# delivery even though the cleanup needed no --force.
+test_preset_ordinary_unlanded_records_discarded() {
+  local case_dir rc
+  case_dir=$(make_case preset-ordinary-unlanded)
+  write_meta "$case_dir" local-only ship
+  seed_preset_provenance "$case_dir"
+  wt_commit_file "$case_dir" feature.txt hello "unlanded feature"
+  # The fork push is what lets the ordinary safety gate pass: the commit is on
+  # a remote, so teardown never treats it as at-risk unpushed work.
+  add_fork_with_pushed_branch "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "preset-ordinary-unlanded: ordinary teardown should succeed"$'\n'"$(cat "$case_dir/stderr")"
+  [ "$(preset_finish_outcome "$case_dir")" = '{"delivery_outcome":"discarded","discard_authorized":false}' ] \
+    || fail "preset-ordinary-unlanded: conclusively unlanded work was not recorded as discarded: $(preset_finish_outcome "$case_dir")"
+  pass "an ordinary cleanup of conclusively unlanded work records a discarded delivery"
+}
+
+# When no landing proof can complete, the ordinary path must record unknown
+# rather than claim the unconditional landed outcome it used to assume.
+test_preset_ordinary_unprovable_records_unknown() {
+  local case_dir rc
+  case_dir=$(make_case preset-ordinary-unknown)
+  write_meta "$case_dir" local-only ship
+  seed_preset_provenance "$case_dir"
+  wt_commit_file "$case_dir" feature.txt hello "feature with no provable PR"
+  add_fork_with_pushed_branch "$case_dir"
+  # A failed PR lookup makes the merged-PR proof inconclusive while the content
+  # and local-default proofs are conclusive negatives: delivery can be neither
+  # confirmed nor denied, so the finish event must keep it explicitly unknown.
+  cat > "$case_dir/fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$case_dir/fakebin/gh-axi"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "preset-ordinary-unknown: ordinary teardown should succeed"$'\n'"$(cat "$case_dir/stderr")"
+  [ "$(preset_finish_outcome "$case_dir")" = '{"delivery_outcome":"unknown","discard_authorized":false}' ] \
+    || fail "preset-ordinary-unknown: unprovable delivery was not kept unknown: $(preset_finish_outcome "$case_dir")"
+  pass "an ordinary cleanup with unprovable delivery evidence records unknown"
+}
+
+# The local-only delivery path lands by fast-forwarding the clone's own default
+# branch, which need not have been pushed anywhere. That is landed evidence for
+# the ordinary cleanup path too, not only for the local-only safety gate.
+test_preset_ordinary_local_main_landed_records_landed() {
+  local case_dir rc wt_head
+  case_dir=$(make_case preset-ordinary-local-landed)
+  write_meta "$case_dir" local-only ship
+  seed_preset_provenance "$case_dir"
+  wt_commit_file "$case_dir" feature.txt hello "landed feature"
+  wt_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  git -C "$case_dir/project" update-ref refs/heads/main "$wt_head"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "preset-ordinary-local-landed: ordinary teardown should succeed"$'\n'"$(cat "$case_dir/stderr")"
+  [ "$(preset_finish_outcome "$case_dir")" = '{"delivery_outcome":"landed","discard_authorized":false}' ] \
+    || fail "preset-ordinary-local-landed: local-default landing was not recorded as landed: $(preset_finish_outcome "$case_dir")"
+  pass "an ordinary cleanup of work contained in the local default branch records landed"
+}
+
+# The forced path shares that same landing evidence: an explicitly authorized
+# cleanup of work already in the local default branch is a landed delivery
+# whose local copy was discarded, never a discarded delivery.
+test_preset_force_local_main_landed_records_landed_with_authorized_discard() {
+  local case_dir rc wt_head
+  case_dir=$(make_case preset-force-local-landed)
+  write_meta "$case_dir" local-only ship
+  seed_preset_provenance "$case_dir"
+  wt_commit_file "$case_dir" feature.txt hello "landed feature"
+  wt_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  git -C "$case_dir/project" update-ref refs/heads/main "$wt_head"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "preset-force-local-landed: forced teardown should succeed"$'\n'"$(cat "$case_dir/stderr")"
+  [ "$(preset_finish_outcome "$case_dir")" = '{"delivery_outcome":"landed","discard_authorized":true}' ] \
+    || fail "preset-force-local-landed: local-default landing under --force was not recorded as landed: $(preset_finish_outcome "$case_dir")"
+  pass "a forced cleanup of work contained in the local default branch records landed with an authorized discard"
+}
+
 # A pending-close record is what a later startup replay trusts to close the
 # backlog row and retire the sampled choice and runtime observation. It must
 # therefore never become replayable before the finish event is durable: a
@@ -3915,6 +4015,10 @@ test_preset_force_landed_records_landed_with_authorized_discard
 test_preset_force_unlanded_records_discarded
 test_preset_force_unprovable_records_unknown
 test_preset_force_scout_with_report_records_report_complete
+test_preset_ordinary_unlanded_records_discarded
+test_preset_ordinary_unprovable_records_unknown
+test_preset_ordinary_local_main_landed_records_landed
+test_preset_force_local_main_landed_records_landed_with_authorized_discard
 test_teardown_closes_the_backlog_item_itself
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator
 test_local_only_truly_unpushed_refuses

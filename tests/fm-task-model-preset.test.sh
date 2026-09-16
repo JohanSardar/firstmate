@@ -466,6 +466,45 @@ claude_missing=$(jq -c -s 'map(select(.event=="finish"))[2] | {status: .runtime_
 [ "$claude_missing" = '{"status":"unknown","usage":"unknown","reason":"expected one Claude transcript, found 0"}' ] \
   || fail "a missing Claude transcript did not carry its precise unknown usage block: $claude_missing"
 
+# A transcript that exists but carries no attributable assistant line returns
+# null usage. The observation and the finish event's usage block must name that
+# cause instead of the generic "no observation was supplied" fallback.
+session_noline=77777777-1111-2222-3333-444444444444
+transcript_noline="$claude_dir/config/projects/worktree/$session_noline.jsonl"
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"go"}}' > "$transcript_noline"
+write_claude_meta s4 "$session_noline"
+CLAUDE_CONFIG_DIR="$claude_dir/config" FM_DATA_OVERRIDE="$claude_dir/data" "$METRICS" finish \
+  "$claude_dir/state/claude-task.meta" "$claude_dir/state/claude-task.dispatch-choice.json" landed || fail "Claude no-assistant-line finish metric failed"
+claude_noline=$(jq -c -s 'map(select(.event=="finish"))[3] | {status: .runtime_observed.status, reason: .runtime_observed.reason, usage_status: .usage.status, usage_reason: .usage.reason}' "$claude_ledger")
+case "$claude_noline" in
+  *'"status":"unknown"'*'"reason":"no attributable assistant line'*'"usage_status":"unknown"'*'"usage_reason":"no attributable assistant line'*) ;;
+  *) fail "a Claude transcript without an attributable assistant line did not carry the precise per-incarnation reason: $claude_noline" ;;
+esac
+case "$claude_noline" in
+  *"no task-attributable provider usage observation was supplied"*) fail "an empty Claude transcript fell back to the generic usage reason: $claude_noline" ;;
+esac
+pass "a Claude transcript without an assistant line names the precise null-usage cause"
+
+# An existing but unreadable transcript also returns null usage; the reason
+# must name the unreadable path rather than the generic fallback.
+session_unreadable=88888888-1111-2222-3333-444444444444
+transcript_unreadable="$claude_dir/config/projects/worktree/$session_unreadable.jsonl"
+printf '%s\n' '{"type":"assistant","message":{"id":"msg_x","model":"claude-opus-5","usage":{"input_tokens":1}}}' > "$transcript_unreadable"
+chmod 000 "$transcript_unreadable"
+write_claude_meta s5 "$session_unreadable"
+CLAUDE_CONFIG_DIR="$claude_dir/config" FM_DATA_OVERRIDE="$claude_dir/data" "$METRICS" finish \
+  "$claude_dir/state/claude-task.meta" "$claude_dir/state/claude-task.dispatch-choice.json" landed || fail "Claude unreadable-transcript finish metric failed"
+claude_unreadable=$(jq -c -s 'map(select(.event=="finish"))[4] | {status: .runtime_observed.status, reason: .runtime_observed.reason, usage_status: .usage.status, usage_reason: .usage.reason}' "$claude_ledger")
+case "$claude_unreadable" in
+  *'"status":"unknown"'*"$transcript_unreadable"*'"usage_status":"unknown"'*"$transcript_unreadable"*) ;;
+  *) fail "an unreadable Claude transcript did not name the unreadable path as its null-usage cause: $claude_unreadable" ;;
+esac
+case "$claude_unreadable" in
+  *"no task-attributable provider usage observation was supplied"*) fail "an unreadable Claude transcript fell back to the generic usage reason: $claude_unreadable" ;;
+esac
+chmod 600 "$transcript_unreadable"
+pass "an unreadable Claude transcript names the unreadable path as its null-usage cause"
+
 # A relaunch re-mints the runtime session id and records a second
 # launch-prepared event. The finish event must aggregate every recorded
 # incarnation instead of counting only the last one, and it must stay unknown
