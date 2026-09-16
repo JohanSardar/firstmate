@@ -108,6 +108,10 @@ cmp -s "$case_dir/race-a.json" "$case_dir/race-b.json" || fail "concurrent selec
 choice_links=$(stat -f '%l' "$case_dir/concurrent-state/race-task.dispatch-choice.json" 2>/dev/null \
   || stat -c '%h' "$case_dir/concurrent-state/race-task.dispatch-choice.json")
 [ "$choice_links" = 1 ] || fail "durable choice did not settle to one link"
+ln "$case_dir/concurrent-state/race-task.dispatch-choice.json" "$case_dir/concurrent-state/.race-task.dispatch-choice.json.99999.0"
+FM_STATE_OVERRIDE="$case_dir/concurrent-state" "$PRESET" select race-task weighted-example "$case_dir/config.json" > "$case_dir/race-c.json" \
+  || fail "a leftover publication link blocked reuse of the durable choice"
+cmp -s "$case_dir/race-a.json" "$case_dir/race-c.json" || fail "retry beside a leftover publication link did not reuse the durable choice"
 
 cat > "$case_dir/unavailable.json" <<'JSON'
 {"schema_version":1,"presets":{"blocked":{"mode":"fixed","candidate":{"id":"disabled-product","harness":"opencode","model":"vendor/model-disabled","effort":"xhigh","available":false,"unavailable_reason":"product approval is pending"}}}}
@@ -139,6 +143,16 @@ invalid_rc=$?
 set -e
 [ "$invalid_rc" -ne 0 ] || fail "OpenCode effort outside the relaunch-safe vocabulary passed validation"
 assert_contains "$invalid_out" "effort 'minimal' is unsupported for opencode" "OpenCode effort validation"
+
+cat > "$case_dir/invalid-grok-max.json" <<'JSON'
+{"schema_version":1,"presets":{"bad":{"mode":"fixed","candidate":{"id":"bad","harness":"grok","model":"grok-example","effort":"max"}}}}
+JSON
+set +e
+invalid_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" validate "$case_dir/invalid-grok-max.json" 2>&1)
+invalid_rc=$?
+set -e
+[ "$invalid_rc" -ne 0 ] || fail "grok max passed validation"
+assert_contains "$invalid_out" "effort 'max' is unsupported for grok" "grok max rejection"
 
 metrics_dir="$TMP_ROOT/metrics"
 mkdir -p "$metrics_dir/data" "$metrics_dir/state"
@@ -1081,5 +1095,12 @@ case "$merged_partial" in
   *'"status":"unknown"'*'"partial":true'*'"effort_used":"max"'*'"fast_requested":false'*'"usage":"unknown"'*'without measurable usage'*) ;;
   *) fail "a partial collector result was not preserved through the merge: $merged_partial" ;;
 esac
+
+# Usage output is the selector's documentation contract: it ends with the last
+# sentence of the header comment and must not leak shell code after it.
+usage_out=$(FM_STATE_OVERRIDE="$case_dir/state" "$PRESET" --help) || fail "--help exited non-zero"
+assert_contains "$usage_out" "fm-task-model-preset.sh select <task-id> <preset-name>" "usage text"
+[ "$(printf '%s\n' "$usage_out" | tail -n 1)" = "remain in the weighted draw and stop a sampled launch explicitly." ] \
+  || fail "usage output leaked past the header comment: $(printf '%s\n' "$usage_out" | tail -n 1)"
 
 echo "PASS: task/model presets are deterministic, weighted, explicit on unavailability, and conservatively measured"

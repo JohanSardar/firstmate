@@ -541,7 +541,7 @@ A subscription estimate is emitted only when quota fraction, monthly price, and 
 Missing prices, missing usage, shared-pool attribution gaps, unproved server-side fast service, and incompatible reset periods remain unknown.
 Nothing in this ledger is exact billing.
 
-Bootstrap validates a present file and emits `TASK_MODEL_PRESETS: invalid config/task-model-presets.json - ...` on malformed input; valid input is silent unless verbose bootstrap facts are enabled.
+Bootstrap validates a present file and emits `TASK_MODEL_PRESETS: invalid config/task-model-presets.json - ...` on malformed input; valid input is silent unless verbose bootstrap facts are enabled, and a missing `node` is reported once through the normal `MISSING: node` flow while the preset check stays silent.
 `bin/fm-task-model-preset.sh` owns validation and deterministic selection, `bin/fm-spawn.sh` owns live adapter checks and effective launch controls, and `bin/fm-dispatch-metrics.sh` owns the private comparison ledger.
 
 ## Toolchain
